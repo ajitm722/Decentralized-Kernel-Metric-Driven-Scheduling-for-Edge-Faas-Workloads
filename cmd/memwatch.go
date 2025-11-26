@@ -23,51 +23,54 @@ func init() {
 	rootCmd.AddCommand(memwatchCmd)
 }
 
+// StartMEMCollector starts the eBPF memory collector and returns a channel with memory pressure %.
+//
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go mem_collector ../bpf/mem_collector.c -- -I../bpf/headers
-
-func runMemWatch(cmd *cobra.Command, args []string) {
+func StartMEMCollector() (<-chan float64, func(), error) {
 
 	if err := rlimit.RemoveMemlock(); err != nil {
-		log.Fatalf("rlimit error: %v", err)
+		return nil, nil, fmt.Errorf("rlimit error: %v", err)
 	}
 
 	var objs mem_collectorObjects
 	if err := loadMem_collectorObjects(&objs, nil); err != nil {
-		log.Fatalf("loading objects: %v", err)
+		return nil, nil, fmt.Errorf("loading mem objects: %v", err)
 	}
-	defer objs.Close()
 
-	// Attach begin
 	hBegin, err := link.Tracepoint("vmscan", "mm_vmscan_direct_reclaim_begin", objs.HandleReclaimBegin, nil)
 	if err != nil {
-		log.Fatalf("Failed to attach reclaim_begin: %v", err)
+		objs.Close()
+		return nil, nil, fmt.Errorf("attach reclaim_begin: %v", err)
 	}
-	defer hBegin.Close()
 
-	// Attach end
 	hEnd, err := link.Tracepoint("vmscan", "mm_vmscan_direct_reclaim_end", objs.HandleReclaimEnd, nil)
 	if err != nil {
-		log.Fatalf("Failed to attach reclaim_end: %v", err)
+		hBegin.Close()
+		objs.Close()
+		return nil, nil, fmt.Errorf("attach reclaim_end: %v", err)
 	}
-	defer hEnd.Close()
 
-	fmt.Println("Collecting MEMORY pressure... CTRL+C to stop")
+	cleanup := func() {
+		hBegin.Close()
+		hEnd.Close()
+		objs.Close()
+	}
 
-	var key uint32 = 0
-	last := uint64(0)
+	out := make(chan float64)
 
-	interval := 500 * time.Millisecond
-	intervalNS := uint64(interval.Nanoseconds())
+	go func() {
+		defer close(out)
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+		var key uint32 = 0
+		last := uint64(0)
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+		interval := 500 * time.Millisecond
+		intervalNS := uint64(interval.Nanoseconds())
 
-	for {
-		select {
-		case <-ticker.C:
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for range ticker.C {
 
 			var total uint64
 			if err := objs.MemStallNs.Lookup(&key, &total); err != nil {
@@ -79,10 +82,33 @@ func runMemWatch(cmd *cobra.Command, args []string) {
 
 			memPercent := (float64(delta) / float64(intervalNS)) * 100.0
 
-			fmt.Printf("MEM: %.2f%%\n", memPercent)
+			out <- memPercent
+		}
+	}()
+
+	return out, cleanup, nil
+}
+
+func runMemWatch(cmd *cobra.Command, args []string) {
+
+	memStream, cleanup, err := StartMEMCollector()
+	if err != nil {
+		log.Fatalf("memory collector init error: %v", err)
+	}
+	defer cleanup()
+
+	fmt.Println("Collecting MEMORY pressure… CTRL+C to stop")
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	for {
+		select {
+		case v := <-memStream:
+			fmt.Printf("MEM: %.2f%%\n", v)
 
 		case <-stop:
-			fmt.Println("Stopping mem collector...")
+			fmt.Println("Stopping mem collector…")
 			return
 		}
 	}

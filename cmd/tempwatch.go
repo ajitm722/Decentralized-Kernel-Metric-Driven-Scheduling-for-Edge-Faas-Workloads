@@ -42,72 +42,86 @@ Reads:
 
 Only one zone is tracked (the first one observed), matching the eBPF logic.
 */
-func runTempWatch(cmd *cobra.Command, args []string) {
+// TempReading holds thermal zone data for streaming.
 
-	// Allow eBPF program + maps to lock memory
+type TempReading struct {
+	TempC  float64
+	Status string
+	Zone   string
+}
+
+// StartTEMPCollector starts the eBPF thermal collector and returns a TempReading channel.
+func StartTEMPCollector() (<-chan TempReading, func(), error) {
+
 	if err := rlimit.RemoveMemlock(); err != nil {
-		log.Fatalf("rlimit error: %v", err)
+		return nil, nil, fmt.Errorf("rlimit error: %v", err)
 	}
 
-	// Load thermal collector objects
 	var objs thermal_collectorObjects
 	if err := loadThermal_collectorObjects(&objs, nil); err != nil {
-		log.Fatalf("loading objects: %v", err)
+		return nil, nil, fmt.Errorf("loading thermal objects: %v", err)
 	}
-	defer objs.Close()
 
-	// Attach BPF program to tracepoint
 	tp, err := link.Tracepoint("thermal", "thermal_temperature", objs.HandleThermalTemp, nil)
 	if err != nil {
-		log.Fatalf("cannot attach thermal tracepoint: %v", err)
+		objs.Close()
+		return nil, nil, fmt.Errorf("attach thermal tracepoint: %v", err)
 	}
-	defer tp.Close()
 
-	fmt.Println("Collecting thermal data (via tracepoint)… CTRL+C to stop")
+	cleanup := func() {
+		tp.Close()
+		objs.Close()
+	}
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	out := make(chan TempReading)
 
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
+	go func() {
+		defer close(out)
 
-	var key uint32 = 0
-	var temp_mc uint32
-	var zoneCount uint32
-	var namebuf [16]byte
+		var key uint32 = 0
+		var tempMC uint32
+		var zoneCount uint32
+		var namebuf [16]byte
 
-	for {
-		select {
-		case <-ticker.C:
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
 
-			// Check if the zone name has been recorded yet
-			if err := objs.ZoneCount.Lookup(&key, &zoneCount); err != nil {
-				fmt.Println("No thermal data yet…")
-				continue
-			}
-			if zoneCount == 0 {
-				fmt.Println("Waiting for first thermal event…")
-				continue
-			}
+		for range ticker.C {
 
-			// Read temperature for zone 0
-			if err := objs.ZoneTemps.Lookup(&key, &temp_mc); err != nil {
+			// --- If no zone has been detected yet, send defaults ---
+			if err := objs.ZoneCount.Lookup(&key, &zoneCount); err != nil || zoneCount == 0 {
+				out <- TempReading{
+					TempC:  0.0,
+					Status: "UNAVAILABLE",
+					Zone:   "unknown",
+				}
 				continue
 			}
 
-			// Read stored zone name
+			// --- If zone exists, try reading actual data ---
+			if err := objs.ZoneTemps.Lookup(&key, &tempMC); err != nil {
+				out <- TempReading{
+					TempC:  0.0,
+					Status: "UNAVAILABLE",
+					Zone:   "unknown",
+				}
+				continue
+			}
+
 			if err := objs.ZoneNames.Lookup(&key, &namebuf); err != nil {
+				out <- TempReading{
+					TempC:  0.0,
+					Status: "UNAVAILABLE",
+					Zone:   "unknown",
+				}
 				continue
 			}
-			zoneName := strings.Trim(string(namebuf[:]), "\x00")
 
-			// Convert to Celsius
-			tempC := float64(temp_mc) / 1000.0
+			zone := strings.Trim(string(namebuf[:]), "\x00")
+			tempC := float64(tempMC) / 1000.0
 
-			// Simple status logic
-			criticalTemp := 103.0 // generic ARM thermal limit for now - 103 C is the critical temp on intel i7
-			pressure := tempC / criticalTemp
-
+			critical := 103.0
+			pressure := tempC / critical
 			status := "SAFE"
 			if pressure >= 0.8 {
 				status = "HOT"
@@ -115,12 +129,39 @@ func runTempWatch(cmd *cobra.Command, args []string) {
 				status = "WARM"
 			}
 
-			// Output
-			fmt.Printf("[%s] %.1f°C (pressure=%.2f) → %s\n",
-				zoneName, tempC, pressure, status)
+			out <- TempReading{
+				TempC:  tempC,
+				Status: status,
+				Zone:   zone,
+			}
+		}
+
+	}()
+
+	return out, cleanup, nil
+}
+
+func runTempWatch(cmd *cobra.Command, args []string) {
+
+	tempStream, cleanup, err := StartTEMPCollector()
+	if err != nil {
+		log.Fatalf("thermal collector init error: %v", err)
+	}
+	defer cleanup()
+
+	fmt.Println("Collecting thermal data… CTRL+C to stop")
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	for {
+		select {
+		case r := <-tempStream:
+			fmt.Printf("[%s] %.1f°C → %s\n",
+				r.Zone, r.TempC, r.Status)
 
 		case <-stop:
-			fmt.Println("Stopping tempwatch…")
+			fmt.Println("Stopping temp collector…")
 			return
 		}
 	}

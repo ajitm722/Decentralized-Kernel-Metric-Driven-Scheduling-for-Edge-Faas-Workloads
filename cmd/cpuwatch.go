@@ -25,50 +25,54 @@ func init() {
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go cpu_collector ../bpf/cpu_collector.c -- -I../bpf/headers
 
-func runCPUWatch(cmd *cobra.Command, args []string) {
+// StartCPUCollector starts the eBPF program and returns a channel that streams CPU usage (%) every poll.
+func StartCPUCollector() (<-chan float64, func(), error) {
 
 	if err := rlimit.RemoveMemlock(); err != nil {
-		log.Fatalf("rlimit error: %v", err)
+		return nil, nil, fmt.Errorf("rlimit error: %v", err)
 	}
 
 	// Load BPF objects
 	var objs cpu_collectorObjects
 	if err := loadCpu_collectorObjects(&objs, nil); err != nil {
-		log.Fatalf("loading objects: %v", err)
+		return nil, nil, fmt.Errorf("loading objects: %v", err)
 	}
-	defer objs.Close()
 
-	// Attach CPU accounting program
+	// Attach programs
 	hSwitch, err := link.Tracepoint("sched", "sched_switch", objs.HandleSchedSwitch, nil)
 	if err != nil {
-		log.Fatalf("Failed to attach sched_switch: %v", err)
+		objs.Close()
+		return nil, nil, fmt.Errorf("attach sched_switch: %v", err)
 	}
-	defer hSwitch.Close()
 
-	// Attach cleanup program
 	hExit, err := link.Tracepoint("sched", "sched_process_exit", objs.HandleProcessExit, nil)
 	if err != nil {
-		log.Fatalf("Failed to attach sched_process_exit: %v", err)
+		hSwitch.Close()
+		objs.Close()
+		return nil, nil, fmt.Errorf("attach sched_exit: %v", err)
 	}
-	defer hExit.Close()
 
-	fmt.Println("Collecting TOTAL CPU usage (with cleanup)... CTRL+C to stop")
+	// Cleanup function
+	cleanup := func() {
+		hSwitch.Close()
+		hExit.Close()
+		objs.Close()
+	}
 
-	lastCPU := make(map[uint32]uint64)
-	poll := 500 * time.Millisecond
-	intervalNS := uint64(poll.Nanoseconds())
+	// Stream channel
+	out := make(chan float64)
 
-	ticker := time.NewTicker(poll)
-	defer ticker.Stop()
+	go func() {
+		defer close(out)
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+		lastCPU := make(map[uint32]uint64)
+		poll := 500 * time.Millisecond
+		intervalNS := uint64(poll.Nanoseconds())
+		ticker := time.NewTicker(poll)
+		defer ticker.Stop()
 
-	for {
-		select {
-		case <-ticker.C:
+		for range ticker.C {
 
-			// Sum of all CPU deltas
 			var totalDelta uint64 = 0
 
 			iter := objs.CpuUsage.Iterate()
@@ -82,18 +86,35 @@ func runCPUWatch(cmd *cobra.Command, args []string) {
 				totalDelta += delta
 			}
 
-			if err := iter.Err(); err != nil {
-				log.Printf("Iterator error: %v", err)
-				continue
-			}
-
-			// Convert to CPU%
 			cpuPercent := (float64(totalDelta) / float64(intervalNS)) * 100.0
 
-			fmt.Printf("CPU: %.2f%%\n", cpuPercent)
+			out <- cpuPercent
+		}
+	}()
+
+	return out, cleanup, nil
+}
+
+func runCPUWatch(cmd *cobra.Command, args []string) {
+
+	cpuStream, cleanup, err := StartCPUCollector()
+	if err != nil {
+		log.Fatalf("CPU collector init error: %v", err)
+	}
+	defer cleanup()
+
+	fmt.Println("Collecting TOTAL CPU usage… CTRL+C to stop")
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	for {
+		select {
+		case v := <-cpuStream:
+			fmt.Printf("CPU: %.2f%%\n", v)
 
 		case <-stop:
-			fmt.Println("Stopping cpu collector...")
+			fmt.Println("Stopping cpu collector…")
 			return
 		}
 	}
