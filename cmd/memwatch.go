@@ -23,7 +23,7 @@ func init() {
 	rootCmd.AddCommand(memwatchCmd)
 }
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target native mem_collector ../bpf/mem_collector.c -- -I../bpf/headers
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go mem_collector ../bpf/mem_collector.c -- -I../bpf/headers
 
 func runMemWatch(cmd *cobra.Command, args []string) {
 

@@ -23,7 +23,7 @@ func init() {
 	rootCmd.AddCommand(cpuwatchCmd)
 }
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target native cpu_collector ../bpf/cpu_collector.c -- -I../bpf/headers
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go cpu_collector ../bpf/cpu_collector.c -- -I../bpf/headers
 
 func runCPUWatch(cmd *cobra.Command, args []string) {
 
