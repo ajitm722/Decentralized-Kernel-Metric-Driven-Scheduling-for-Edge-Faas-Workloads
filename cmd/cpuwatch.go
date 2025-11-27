@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -62,6 +63,22 @@ func StartCPUCollector() (<-chan float64, func(), error) {
 	// Stream channel
 	out := make(chan float64)
 
+	// FIX: Use runtime.GOMAXPROCS(0) instead of runtime.NumCPU().
+	// runtime.NumCPU() returns the host core count, which is inaccurate in a
+	// container with CPU limits (cgroups). GOMAXPROCS reflects the Go
+	// scheduler's view of core capacity.
+	// NOTE: For best results in containers, the user should also use a tool like
+	// "uber-go/automaxprocs" to ensure GOMAXPROCS is correctly set based on cgroup quotas.
+	// avoiding that here as we're not containerising this for now
+	numCPUs := float64(runtime.GOMAXPROCS(0))
+
+	if numCPUs < 1 {
+		// Fallback if GOMAXPROCS is unset or 0, though highly unlikely.
+		numCPUs = float64(runtime.NumCPU())
+	}
+
+	log.Printf("Detected %.0f CPU cores (via GOMAXPROCS) for usage scaling.", numCPUs)
+
 	go func() {
 		defer close(out)
 
@@ -70,6 +87,10 @@ func StartCPUCollector() (<-chan float64, func(), error) {
 		intervalNS := uint64(poll.Nanoseconds())
 		ticker := time.NewTicker(poll)
 		defer ticker.Stop()
+
+		// The interval duration, scaled by the effective number of CPU cores/quota.
+		// This is the correct denominator for total system CPU usage (i.e., 100% capacity).
+		scaledIntervalNS := uint64(float64(intervalNS) * numCPUs)
 
 		for range ticker.C {
 
@@ -86,7 +107,8 @@ func StartCPUCollector() (<-chan float64, func(), error) {
 				totalDelta += delta
 			}
 
-			cpuPercent := (float64(totalDelta) / float64(intervalNS)) * 100.0
+			// Calculate the CPU percentage based on the scaled interval.
+			cpuPercent := (float64(totalDelta) / float64(scaledIntervalNS)) * 100.0
 
 			out <- cpuPercent
 		}
@@ -103,7 +125,8 @@ func runCPUWatch(cmd *cobra.Command, args []string) {
 	}
 	defer cleanup()
 
-	fmt.Println("Collecting TOTAL CPU usage… CTRL+C to stop")
+	// Use GOMAXPROCS(0) in the print statement for consistency
+	fmt.Println("Collecting TOTAL CPU usage (Scaled for", int(float64(runtime.GOMAXPROCS(0))), "cores)… CTRL+C to stop")
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
