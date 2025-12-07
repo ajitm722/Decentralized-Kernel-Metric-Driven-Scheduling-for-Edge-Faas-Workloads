@@ -1,118 +1,155 @@
 package cmd
 
 import (
-    "fmt"
-    "os"
-    "os/signal"
-    "syscall"
-    "time"
+	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-    "github.com/spf13/cobra"
+	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
+
+	pb "ebpf_edge/proto"
 )
 
 // aggregateCmd is the Cobra command that runs all collectors together.
 var aggregateCmd = &cobra.Command{
-    Use:   "aggregate",
-    Short: "Aggregate CPU, memory, and temperature metrics into a unified output",
-    Run:   runAggregate,
+	Use:   "aggregate",
+	Short: "Aggregate CPU, memory, and temperature metrics into a unified output",
+	Run:   runAggregate,
 }
 
 func init() {
-    rootCmd.AddCommand(aggregateCmd)
+	rootCmd.AddCommand(aggregateCmd)
 }
 
 // runAggregate launches all collectors as goroutines, consumes their streams,
 // and updates a shared MetricsSnapshot structure.
-// This allows the aggregator to serve as a single producer of unified metrics.
 func runAggregate(cmd *cobra.Command, args []string) {
 
-    var snap MetricsSnapshot
+	// ----------------------------------------------------
+	// Connect to leader (HOST MACHINE)
+	// ----------------------------------------------------
+	conn, err := grpc.Dial("192.168.0.250:60000", grpc.WithInsecure())
+	// 10.0.2.2 = host machine from inside QEMU
+	if err != nil {
+		fmt.Println("Failed to connect to leader:", err)
+		return
+	}
+	defer conn.Close()
 
-    // ----------------------------------------------------
-    // Start all collectors and get their cleanup functions.
-    // ----------------------------------------------------
-    cpuStream, cpuCleanup, err := StartCPUCollector()
-    if err != nil {
-        fmt.Println("CPU collector init error:", err)
-        return
-    }
-    defer cpuCleanup()
+	client := pb.NewMetricsServiceClient(conn)
 
-    memStream, memCleanup, err := StartMEMCollector()
-    if err != nil {
-        fmt.Println("MEM collector init error:", err)
-        return
-    }
-    defer memCleanup()
+	// Shared snapshot
+	var snap MetricsSnapshot
 
-    tempStream, tempCleanup, err := StartTEMPCollector()
-    if err != nil {
-        fmt.Println("TEMP collector init error:", err)
-        return
-    }
-    defer tempCleanup()
+	// ----------------------------------------------------
+	// Start all collectors and get their cleanup functions.
+	// ----------------------------------------------------
+	cpuStream, cpuCleanup, err := StartCPUCollector()
+	if err != nil {
+		fmt.Println("CPU collector init error:", err)
+		return
+	}
+	defer cpuCleanup()
 
-    // ----------------------------------------------------
-    // Handle stop signal for clean termination.
-    // ----------------------------------------------------
-    stop := make(chan os.Signal, 1)
-    signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	memStream, memCleanup, err := StartMEMCollector()
+	if err != nil {
+		fmt.Println("MEM collector init error:", err)
+		return
+	}
+	defer memCleanup()
 
-    // ----------------------------------------------------
-    // CPU consumer goroutine
-    // Each collector streams updates, and the aggregator just updates the snapshot.
-    // ----------------------------------------------------
-    go func() {
-        for v := range cpuStream {
-            snap.UpdateCPU(v)
-        }
-    }()
+	tempStream, tempCleanup, err := StartTEMPCollector()
+	if err != nil {
+		fmt.Println("TEMP collector init error:", err)
+		return
+	}
+	defer tempCleanup()
 
-    // ----------------------------------------------------
-    // Memory consumer goroutine
-    // ----------------------------------------------------
-    go func() {
-        for v := range memStream {
-            snap.UpdateMem(v)
-        }
-    }()
+	// ----------------------------------------------------
+	// Handle stop signal for clean termination.
+	// ----------------------------------------------------
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
-    // ----------------------------------------------------
-    // Temperature consumer goroutine
-    // ----------------------------------------------------
-    go func() {
-        for r := range tempStream {
-            snap.UpdateTemp(r)
-        }
-    }()
+	// ----------------------------------------------------
+	// CPU consumer goroutine
+	// ----------------------------------------------------
+	go func() {
+		for v := range cpuStream {
+			snap.UpdateCPU(v)
+		}
+	}()
 
-    // ----------------------------------------------------
-    // Main output loop
-    // Reads a copy of the snapshot every second and prints it.
-    // Later, this is where we will call gRPC to send the data.
-    // ----------------------------------------------------
-    ticker := time.NewTicker(1 * time.Second)
-    defer ticker.Stop()
+	// ----------------------------------------------------
+	// Memory consumer goroutine
+	// ----------------------------------------------------
+	go func() {
+		for v := range memStream {
+			snap.UpdateMem(v)
+		}
+	}()
 
-    fmt.Println("Running aggregator... CTRL+C to stop")
+	// ----------------------------------------------------
+	// Temperature consumer goroutine
+	// ----------------------------------------------------
+	go func() {
+		for r := range tempStream {
+			snap.UpdateTemp(r)
+		}
+	}()
 
-    for {
-        select {
-        case <-ticker.C:
-            s := snap.Read()
+	// ----------------------------------------------------
+	// Main output + sending loop
+	// ----------------------------------------------------
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
-            fmt.Printf("[AGG] CPU=%.2f%%  MEM=%.2f%%  TEMP=%.1f°C (%s)  zone=%s\n",
-                s.CPUPercent,
-                s.MemPercent,
-                s.TempC,
-                s.TempStatus,
-                s.ZoneName,
-            )
+	fmt.Println("Running aggregator... CTRL+C to stop")
 
-        case <-stop:
-            fmt.Println("Stopping aggregator...")
-            return
-        }
-    }
+	for {
+		select {
+		case <-ticker.C:
+			s := snap.Read()
+
+			// send snapshot to leader
+			sendToLeader(client, s)
+
+			// optional: also display on console
+			fmt.Printf("[AGG] CPU=%.2f%%  MEM=%.2f%%  TEMP=%.1f°C (%s)  zone=%s\n",
+				s.CPUPercent,
+				s.MemPercent,
+				s.TempC,
+				s.TempStatus,
+				s.ZoneName,
+			)
+
+		case <-stop:
+			fmt.Println("Stopping aggregator...")
+			return
+		}
+	}
 }
 
+// ----------------------------------------------------
+// Helper: Send snapshot to leader via gRPC
+// ----------------------------------------------------
+func sendToLeader(client pb.MetricsServiceClient, s MetricsSnapshot) {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	_, err := client.Push(ctx, &pb.MetricsSnapshot{
+		Cpu:        s.CPUPercent,
+		Mem:        s.MemPercent,
+		TempC:      s.TempC,
+		TempStatus: s.TempStatus,
+		Zone:       s.ZoneName,
+	})
+
+	if err != nil {
+		fmt.Println("RPC error:", err)
+	}
+}

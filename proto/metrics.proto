@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package metrics;
+
+// Generate Go code into the local ./proto directory
+// and expose Go package name "metrics"
+option go_package = "ebpf_edge/proto;metrics";
+
+message MetricsSnapshot {
+  double cpu = 1;
+  double mem = 2;
+  double temp_c = 3;
+  string temp_status = 4;
+  string zone = 5;
+}
+
+message Ack {
+  string msg = 1;
+}
+
+service MetricsService {
+  rpc Push (MetricsSnapshot) returns (Ack);
+}
+
