@@ -6,9 +6,11 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/spf13/cobra"
@@ -16,7 +18,7 @@ import (
 
 var cpuwatchCmd = &cobra.Command{
 	Use:   "cpuwatch",
-	Short: "Collect total node-wide CPU usage using sched_switch (with cleanup)",
+	Short: "Collect CPU usage (Auto-Detect Core vs Tegra)",
 	Run:   runCPUWatch,
 }
 
@@ -24,120 +26,133 @@ func init() {
 	rootCmd.AddCommand(cpuwatchCmd)
 }
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go cpu_collector ../bpf/cpu_collector.c -- -I../bpf/headers
+// Generate BOTH binaries with the correct include path for Ubuntu headers.
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go cpu_core ../bpf/cpu_core.c -- -O2 -target bpf -I/usr/include/x86_64-linux-gnu
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go cpu_tegra ../bpf/cpu_tegra.c -- -O2 -target bpf -I/usr/include/x86_64-linux-gnu
 
-// StartCPUCollector starts the eBPF program and returns a channel that streams CPU usage (%) every poll.
 func StartCPUCollector() (<-chan float64, func(), error) {
 
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return nil, nil, fmt.Errorf("rlimit error: %v", err)
 	}
 
-	// Load BPF objects
-	var objs cpu_collectorObjects
-	if err := loadCpu_collectorObjects(&objs, nil); err != nil {
-		return nil, nil, fmt.Errorf("loading objects: %v", err)
+	var (
+		hSwitch link.Link
+		hExit   link.Link
+		cpuMap  *ebpf.Map
+		cleanup func()
+		progS   *ebpf.Program
+		progE   *ebpf.Program
+	)
+
+	// 1. Detect Kernel
+	var uname syscall.Utsname
+	syscall.Uname(&uname)
+	var releaseBuf []byte
+	for _, b := range uname.Release {
+		if b == 0 {
+			break
+		}
+		releaseBuf = append(releaseBuf, byte(b))
+	}
+	release := string(releaseBuf)
+	log.Printf("Kernel Detected: %s", release)
+
+	// 2. Load the Right Object
+	if strings.Contains(release, "tegra") {
+		log.Println("Mode: JETSON TEGRA (Offset 28)")
+		var objs cpu_tegraObjects
+		if err := loadCpu_tegraObjects(&objs, nil); err != nil {
+			return nil, nil, fmt.Errorf("load tegra: %v", err)
+		}
+		progS = objs.HandleSchedSwitch
+		progE = objs.HandleProcessExit
+		cpuMap = objs.CpuUsage
+		cleanup = func() { objs.Close() }
+	} else {
+		log.Println("Mode: STANDARD CORE (Offset 24)")
+		var objs cpu_coreObjects
+		if err := loadCpu_coreObjects(&objs, nil); err != nil {
+			return nil, nil, fmt.Errorf("load core: %v", err)
+		}
+		progS = objs.HandleSchedSwitch
+		progE = objs.HandleProcessExit
+		cpuMap = objs.CpuUsage
+		cleanup = func() { objs.Close() }
 	}
 
-	// Attach programs
-	hSwitch, err := link.Tracepoint("sched", "sched_switch", objs.HandleSchedSwitch, nil)
+	// 3. Attach Tracepoints
+	var err error
+	hSwitch, err = link.Tracepoint("sched", "sched_switch", progS, nil)
 	if err != nil {
-		objs.Close()
-		return nil, nil, fmt.Errorf("attach sched_switch: %v", err)
+		cleanup()
+		return nil, nil, fmt.Errorf("attach switch: %v", err)
 	}
 
-	hExit, err := link.Tracepoint("sched", "sched_process_exit", objs.HandleProcessExit, nil)
+	hExit, err = link.Tracepoint("sched", "sched_process_exit", progE, nil)
 	if err != nil {
 		hSwitch.Close()
-		objs.Close()
-		return nil, nil, fmt.Errorf("attach sched_exit: %v", err)
+		cleanup()
+		return nil, nil, fmt.Errorf("attach exit: %v", err)
 	}
 
-	// Cleanup function
-	cleanup := func() {
+	finalCleanup := func() {
 		hSwitch.Close()
 		hExit.Close()
-		objs.Close()
+		cleanup()
 	}
 
-	// Stream channel
+	// 4. Start Polling
 	out := make(chan float64)
-
-	// FIX: Use runtime.GOMAXPROCS(0) instead of runtime.NumCPU().
-	// runtime.NumCPU() returns the host core count, which is inaccurate in a
-	// container with CPU limits (cgroups). GOMAXPROCS reflects the Go
-	// scheduler's view of core capacity.
-	// NOTE: For best results in containers, the user should also use a tool like
-	// "uber-go/automaxprocs" to ensure GOMAXPROCS is correctly set based on cgroup quotas.
-	// avoiding that here as we're not containerising this for now
 	numCPUs := float64(runtime.GOMAXPROCS(0))
-
 	if numCPUs < 1 {
-		// Fallback if GOMAXPROCS is unset or 0, though highly unlikely.
 		numCPUs = float64(runtime.NumCPU())
 	}
 
-	log.Printf("Detected %.0f CPU cores (via GOMAXPROCS) for usage scaling.", numCPUs)
-
 	go func() {
 		defer close(out)
-
 		lastCPU := make(map[uint32]uint64)
 		poll := 500 * time.Millisecond
 		intervalNS := uint64(poll.Nanoseconds())
+		scaledIntervalNS := uint64(float64(intervalNS) * numCPUs)
+
 		ticker := time.NewTicker(poll)
 		defer ticker.Stop()
 
-		// The interval duration, scaled by the effective number of CPU cores/quota.
-		// This is the correct denominator for total system CPU usage (i.e., 100% capacity).
-		scaledIntervalNS := uint64(float64(intervalNS) * numCPUs)
-
 		for range ticker.C {
-
-			var totalDelta uint64 = 0
-
-			iter := objs.CpuUsage.Iterate()
+			var totalDelta uint64
 			var pid uint32
 			var ns uint64
 
+			iter := cpuMap.Iterate()
 			for iter.Next(&pid, &ns) {
 				prev := lastCPU[pid]
-				delta := ns - prev
+				if ns > prev {
+					totalDelta += ns - prev
+				}
 				lastCPU[pid] = ns
-				totalDelta += delta
 			}
-
-			// Calculate the CPU percentage based on the scaled interval.
-			cpuPercent := (float64(totalDelta) / float64(scaledIntervalNS)) * 100.0
-
-			out <- cpuPercent
+			out <- (float64(totalDelta) / float64(scaledIntervalNS)) * 100.0
 		}
 	}()
 
-	return out, cleanup, nil
+	return out, finalCleanup, nil
 }
 
 func runCPUWatch(cmd *cobra.Command, args []string) {
-
-	cpuStream, cleanup, err := StartCPUCollector()
+	stream, cleanup, err := StartCPUCollector()
 	if err != nil {
-		log.Fatalf("CPU collector init error: %v", err)
+		log.Fatal(err)
 	}
 	defer cleanup()
-
-	// Use GOMAXPROCS(0) in the print statement for consistency
-	fmt.Println("Collecting TOTAL CPU usage (Scaled for", int(float64(runtime.GOMAXPROCS(0))), "cores)… CTRL+C to stop")
-
+	fmt.Println("Collecting CPU... CTRL+C to stop")
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-
 	for {
 		select {
-		case v := <-cpuStream:
+		case v := <-stream:
 			fmt.Printf("CPU: %.2f%%\n", v)
-
 		case <-stop:
-			fmt.Println("Stopping cpu collector…")
 			return
 		}
 	}

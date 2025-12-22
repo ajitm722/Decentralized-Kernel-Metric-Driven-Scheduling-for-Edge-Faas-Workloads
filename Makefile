@@ -87,8 +87,13 @@ generate:
 # BUILD GO BINARY
 #######################################################################
 
-build:
-	go build -o ebpf_edge .
+build-amd64:
+	@echo "Building for AMD64 (Host)..."
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ebpf_edge_amd64 .
+
+build-arm64:
+	@echo "Building for ARM64 (Jetson/Pi)..."
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o ebpf_edge_arm64 .
 
 #######################################################################
 # CLEAN GENERATED FILES

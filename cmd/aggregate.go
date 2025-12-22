@@ -33,7 +33,7 @@ func runAggregate(cmd *cobra.Command, args []string) {
 	// Connect to leader (HOST MACHINE)
 	// ----------------------------------------------------
 	conn, err := grpc.Dial("192.168.0.250:60000", grpc.WithInsecure())
-	// 10.0.2.2 = host machine from inside QEMU
+
 	if err != nil {
 		fmt.Println("Failed to connect to leader:", err)
 		return
