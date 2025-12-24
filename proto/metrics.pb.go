@@ -28,6 +28,7 @@ type MetricsSnapshot struct {
 	TempC         float64                `protobuf:"fixed64,3,opt,name=temp_c,json=tempC,proto3" json:"temp_c,omitempty"`
 	TempStatus    string                 `protobuf:"bytes,4,opt,name=temp_status,json=tempStatus,proto3" json:"temp_status,omitempty"`
 	Zone          string                 `protobuf:"bytes,5,opt,name=zone,proto3" json:"zone,omitempty"`
+	Hardware      string                 `protobuf:"bytes,6,opt,name=hardware,proto3" json:"hardware,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -97,9 +98,17 @@ func (x *MetricsSnapshot) GetZone() string {
 	return ""
 }
 
+func (x *MetricsSnapshot) GetHardware() string {
+	if x != nil {
+		return x.Hardware
+	}
+	return ""
+}
+
 type Ack struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Msg           string                 `protobuf:"bytes,1,opt,name=msg,proto3" json:"msg,omitempty"`
+	ForwardedTo   string                 `protobuf:"bytes,2,opt,name=forwarded_to,json=forwardedTo,proto3" json:"forwarded_to,omitempty"` // Returns the IP of the node that actually took the job
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -141,22 +150,125 @@ func (x *Ack) GetMsg() string {
 	return ""
 }
 
+func (x *Ack) GetForwardedTo() string {
+	if x != nil {
+		return x.ForwardedTo
+	}
+	return ""
+}
+
+// JobRequest defines a workload to be executed
+type JobRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`                     // "IMG_RESIZE", "DATA_ETL"
+	ReqCpu        float64                `protobuf:"fixed64,2,opt,name=req_cpu,json=reqCpu,proto3" json:"req_cpu,omitempty"` // e.g. 20.0
+	ReqMem        float64                `protobuf:"fixed64,3,opt,name=req_mem,json=reqMem,proto3" json:"req_mem,omitempty"` // e.g. 10.0
+	Image         string                 `protobuf:"bytes,4,opt,name=image,proto3" json:"image,omitempty"`                   // Docker image name
+	Args          []string               `protobuf:"bytes,5,rep,name=args,proto3" json:"args,omitempty"`                     // Command arguments
+	Id            string                 `protobuf:"bytes,6,opt,name=id,proto3" json:"id,omitempty"`                         // Unique Job ID
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *JobRequest) Reset() {
+	*x = JobRequest{}
+	mi := &file_proto_metrics_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *JobRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*JobRequest) ProtoMessage() {}
+
+func (x *JobRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_metrics_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use JobRequest.ProtoReflect.Descriptor instead.
+func (*JobRequest) Descriptor() ([]byte, []int) {
+	return file_proto_metrics_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *JobRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *JobRequest) GetReqCpu() float64 {
+	if x != nil {
+		return x.ReqCpu
+	}
+	return 0
+}
+
+func (x *JobRequest) GetReqMem() float64 {
+	if x != nil {
+		return x.ReqMem
+	}
+	return 0
+}
+
+func (x *JobRequest) GetImage() string {
+	if x != nil {
+		return x.Image
+	}
+	return ""
+}
+
+func (x *JobRequest) GetArgs() []string {
+	if x != nil {
+		return x.Args
+	}
+	return nil
+}
+
+func (x *JobRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
 var File_proto_metrics_proto protoreflect.FileDescriptor
 
 const file_proto_metrics_proto_rawDesc = "" +
 	"\n" +
-	"\x13proto/metrics.proto\x12\ametrics\"\x81\x01\n" +
+	"\x13proto/metrics.proto\x12\ametrics\"\x9d\x01\n" +
 	"\x0fMetricsSnapshot\x12\x10\n" +
 	"\x03cpu\x18\x01 \x01(\x01R\x03cpu\x12\x10\n" +
 	"\x03mem\x18\x02 \x01(\x01R\x03mem\x12\x15\n" +
 	"\x06temp_c\x18\x03 \x01(\x01R\x05tempC\x12\x1f\n" +
 	"\vtemp_status\x18\x04 \x01(\tR\n" +
 	"tempStatus\x12\x12\n" +
-	"\x04zone\x18\x05 \x01(\tR\x04zone\"\x17\n" +
+	"\x04zone\x18\x05 \x01(\tR\x04zone\x12\x1a\n" +
+	"\bhardware\x18\x06 \x01(\tR\bhardware\":\n" +
 	"\x03Ack\x12\x10\n" +
-	"\x03msg\x18\x01 \x01(\tR\x03msg2@\n" +
+	"\x03msg\x18\x01 \x01(\tR\x03msg\x12!\n" +
+	"\fforwarded_to\x18\x02 \x01(\tR\vforwardedTo\"\x8c\x01\n" +
+	"\n" +
+	"JobRequest\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x17\n" +
+	"\areq_cpu\x18\x02 \x01(\x01R\x06reqCpu\x12\x17\n" +
+	"\areq_mem\x18\x03 \x01(\x01R\x06reqMem\x12\x14\n" +
+	"\x05image\x18\x04 \x01(\tR\x05image\x12\x12\n" +
+	"\x04args\x18\x05 \x03(\tR\x04args\x12\x0e\n" +
+	"\x02id\x18\x06 \x01(\tR\x02id2p\n" +
 	"\x0eMetricsService\x12.\n" +
-	"\x04Push\x12\x18.metrics.MetricsSnapshot\x1a\f.metrics.AckB\x19Z\x17ebpf_edge/proto;metricsb\x06proto3"
+	"\x04Push\x12\x18.metrics.MetricsSnapshot\x1a\f.metrics.Ack\x12.\n" +
+	"\tSubmitJob\x12\x13.metrics.JobRequest\x1a\f.metrics.AckB\x19Z\x17ebpf_edge/proto;metricsb\x06proto3"
 
 var (
 	file_proto_metrics_proto_rawDescOnce sync.Once
@@ -170,16 +282,19 @@ func file_proto_metrics_proto_rawDescGZIP() []byte {
 	return file_proto_metrics_proto_rawDescData
 }
 
-var file_proto_metrics_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_proto_metrics_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
 var file_proto_metrics_proto_goTypes = []any{
 	(*MetricsSnapshot)(nil), // 0: metrics.MetricsSnapshot
 	(*Ack)(nil),             // 1: metrics.Ack
+	(*JobRequest)(nil),      // 2: metrics.JobRequest
 }
 var file_proto_metrics_proto_depIdxs = []int32{
 	0, // 0: metrics.MetricsService.Push:input_type -> metrics.MetricsSnapshot
-	1, // 1: metrics.MetricsService.Push:output_type -> metrics.Ack
-	1, // [1:2] is the sub-list for method output_type
-	0, // [0:1] is the sub-list for method input_type
+	2, // 1: metrics.MetricsService.SubmitJob:input_type -> metrics.JobRequest
+	1, // 2: metrics.MetricsService.Push:output_type -> metrics.Ack
+	1, // 3: metrics.MetricsService.SubmitJob:output_type -> metrics.Ack
+	2, // [2:4] is the sub-list for method output_type
+	0, // [0:2] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -196,7 +311,7 @@ func file_proto_metrics_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_metrics_proto_rawDesc), len(file_proto_metrics_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   3,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

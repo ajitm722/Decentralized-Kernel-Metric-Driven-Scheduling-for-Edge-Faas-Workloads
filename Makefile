@@ -83,6 +83,12 @@ generate:
 	go generate ./cmd/cpuwatch.go
 	go generate ./cmd/memwatch.go
 
+# Generate gRPC Proto files
+proto_generate:
+	protoc --go_out=. --go_opt=paths=source_relative \
+    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+    proto/metrics.proto
+
 #######################################################################
 # BUILD GO BINARY
 #######################################################################

@@ -8,8 +8,8 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:   "ebpf_edge",
-	Short: "eBPF toolkit for quick system visibility",
-	Long:  "ebpf_edge bundles focused eBPF commands (like procwatch) to watch host activity during troubleshooting.",
+	Short: "Decentralized-Kernel-Metric-Driven-Scheduling-for-Edge-Faas",
+	Long:  "Kernel-metric driven orchestration for decentralized edge computing",
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.

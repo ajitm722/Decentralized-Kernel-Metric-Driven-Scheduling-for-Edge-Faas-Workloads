@@ -2,8 +2,6 @@ syntax = "proto3";
 
 package metrics;
 
-// Generate Go code into the local ./proto directory
-// and expose Go package name "metrics"
 option go_package = "ebpf_edge/proto;metrics";
 
 message MetricsSnapshot {
@@ -12,13 +10,25 @@ message MetricsSnapshot {
   double temp_c = 3;
   string temp_status = 4;
   string zone = 5;
+  string hardware = 6;
 }
 
 message Ack {
   string msg = 1;
+  string forwarded_to = 2; // Returns the IP of the node that actually took the job
+}
+
+// JobRequest defines a workload to be executed
+message JobRequest {
+    string name = 1;         // "IMG_RESIZE", "DATA_ETL"
+    double req_cpu = 2;      // e.g. 20.0
+    double req_mem = 3;      // e.g. 10.0
+    string image = 4;        // Docker image name
+    repeated string args = 5;// Command arguments
+    string id = 6;           // Unique Job ID
 }
 
 service MetricsService {
   rpc Push (MetricsSnapshot) returns (Ack);
+  rpc SubmitJob (JobRequest) returns (Ack); // <--- New RPC
 }
-
