@@ -5,14 +5,16 @@
 typedef unsigned char u8;
 typedef unsigned int u32;
 
-/* JETSON TEGRA LAYOUT (Verified) */
+/* * JETSON TEGRA THERMAL LAYOUT
+ * Used by Orin Nano. Temperature field is at offset 24.
+ */
 struct thermal_tegra
 {
-    u8 pad[12];                  // Common header (0-12)
+    u8 pad[12];                  // Header is larger (12 bytes vs 8)
     u32 __data_loc_thermal_zone; // Offset 12
     int id;                      // Offset 16
     int temp_prev;               // Offset 20
-    int temp;                    // Offset 24 (milli-Celsius)
+    int temp;                    // Offset 24: Temp in milli-Celsius
 };
 
 /* MAPS */
@@ -46,8 +48,7 @@ int handle_thermal_temp(struct thermal_tegra *ctx)
     u32 zero = 0;
     u32 temp_mc = ctx->temp;
 
-    // 1. Read Zone Name
-    // The __data_loc field contains the offset (lower 16 bits)
+    // 1. Read Zone Name (Using Tegra-specific offset calculation)
     u32 offset = ctx->__data_loc_thermal_zone & 0xFFFF;
     const char *zone_ptr = (const char *)ctx + offset;
     char namebuf[16];

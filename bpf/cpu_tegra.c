@@ -6,26 +6,23 @@ typedef unsigned char u8;
 typedef unsigned int u32;
 typedef unsigned long long u64;
 
-/* TEGRA LAYOUT (Jetson Orin Nano)
-   prev_comm @ 12, prev_pid @ 28
-*/
+/* * TEGRA KERNEL LAYOUT (Jetson Orin Nano)
+ * NVIDIA's kernel adds extra padding/fields to the sched_switch tracepoint.
+ * The critical field 'prev_pid' is shifted to offset 28.
+ */
 struct sched_switch_tegra
 {
-    u8 pad[28];   // 12 bytes header + 16 bytes prev_comm
-    int prev_pid; // Offset 28
+    u8 pad[28];   // Padding: 12 bytes (header) + 16 bytes (prev_comm)
+    int prev_pid; // Offset 28: Note the shift compared to standard layout
     int prev_prio;
-    int pad_gap; // Extra gap seen in format
+    int pad_gap; // Extra gap specific to Tegra alignment
     long prev_state;
     u8 next_comm[16];
     int next_pid;
 };
 
-// ... (Exact same Maps and Logic as above) ...
-// Copy the MAP definitions and SEC functions from cpu_core.c exactly.
-// JUST change the struct name in handle_sched_switch argument:
-// int handle_sched_switch(struct sched_switch_tegra *ctx)
+// ... (Exact same Maps as above) ...
 
-/* --- FULL COPY FOR SAFETY --- */
 struct
 {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -42,6 +39,10 @@ struct
     __uint(max_entries, 10240);
 } cpu_usage SEC(".maps");
 
+/*
+ * HOOK: tracepoint/sched/sched_switch
+ * Identical logic to standard, but accepts the 'sched_switch_tegra' struct context.
+ */
 SEC("tracepoint/sched/sched_switch")
 int handle_sched_switch(struct sched_switch_tegra *ctx)
 {
