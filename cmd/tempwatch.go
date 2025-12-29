@@ -35,108 +35,124 @@ type TempReading struct {
 	Zone   string
 }
 
+// thermalBPF abstracts the specific eBPF objects (Tegra vs Core)
+type thermalBPF struct {
+	prog     *ebpf.Program
+	mapTemps *ebpf.Map
+	mapNames *ebpf.Map
+	mapCount *ebpf.Map
+	cleanup  func()
+}
+
+func loadTegraBPF() (*thermalBPF, error) {
+	var objs thermal_tegraObjects
+	if err := loadThermal_tegraObjects(&objs, nil); err != nil {
+		return nil, fmt.Errorf("load tegra temp: %v", err)
+	}
+	return &thermalBPF{
+		prog:     objs.HandleThermalTemp,
+		mapTemps: objs.ZoneTemps,
+		mapNames: objs.ZoneNames,
+		mapCount: objs.ZoneCount,
+		cleanup:  func() { objs.Close() },
+	}, nil
+}
+
+func loadCoreBPF() (*thermalBPF, error) {
+	var objs thermal_coreObjects
+	if err := loadThermal_coreObjects(&objs, nil); err != nil {
+		return nil, fmt.Errorf("load core temp: %v", err)
+	}
+	return &thermalBPF{
+		prog:     objs.HandleThermalTemp,
+		mapTemps: objs.ZoneTemps,
+		mapNames: objs.ZoneNames,
+		mapCount: objs.ZoneCount,
+		cleanup:  func() { objs.Close() },
+	}, nil
+}
+
 func StartTEMPCollector() (<-chan TempReading, func(), error) {
 
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return nil, nil, fmt.Errorf("rlimit error: %v", err)
 	}
 
-	var (
-		tp       link.Link
-		cleanup  func()
-		mapTemps *ebpf.Map
-		mapNames *ebpf.Map
-		mapCount *ebpf.Map
-		prog     *ebpf.Program
-	)
-
 	// 1. Detect Kernel
-	var uname syscall.Utsname
-	syscall.Uname(&uname)
-	var releaseBuf []byte
-	for _, b := range uname.Release {
-		if b == 0 {
-			break
-		}
-		releaseBuf = append(releaseBuf, byte(b))
-	}
-	release := string(releaseBuf)
+	release := detectKernel()
 	log.Printf("Kernel Detected (Temp): %s", release)
 
 	// 2. Load the Right Object
+	var loader func() (*thermalBPF, error)
 	if strings.Contains(release, "tegra") {
-		var objs thermal_tegraObjects
-		if err := loadThermal_tegraObjects(&objs, nil); err != nil {
-			return nil, nil, fmt.Errorf("load tegra temp: %v", err)
-		}
-		prog = objs.HandleThermalTemp
-		mapTemps = objs.ZoneTemps
-		mapNames = objs.ZoneNames
-		mapCount = objs.ZoneCount
-		cleanup = func() { objs.Close() }
+		loader = loadTegraBPF
 	} else {
-		var objs thermal_coreObjects
-		if err := loadThermal_coreObjects(&objs, nil); err != nil {
-			return nil, nil, fmt.Errorf("load core temp: %v", err)
-		}
-		prog = objs.HandleThermalTemp
-		mapTemps = objs.ZoneTemps
-		mapNames = objs.ZoneNames
-		mapCount = objs.ZoneCount
-		cleanup = func() { objs.Close() }
+		loader = loadCoreBPF
+	}
+
+	bpf, err := loader()
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// 3. Attach Tracepoint
-	var err error
-	tp, err = link.Tracepoint("thermal", "thermal_temperature", prog, nil)
+	tp, err := link.Tracepoint("thermal", "thermal_temperature", bpf.prog, nil)
 	if err != nil {
-		cleanup()
+		bpf.cleanup()
 		return nil, nil, fmt.Errorf("attach temp tracepoint: %v", err)
 	}
 
 	finalCleanup := func() {
 		tp.Close()
-		cleanup()
+		bpf.cleanup()
 	}
 
 	out := make(chan TempReading)
 
-	go func() {
-		defer close(out)
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			var key uint32 = 0
-			var tempMC uint32
-			var zoneCount uint32
-			var namebuf [16]byte
-
-			if err := mapCount.Lookup(&key, &zoneCount); err != nil || zoneCount == 0 {
-				continue
-			}
-			if err := mapTemps.Lookup(&key, &tempMC); err != nil {
-				continue
-			}
-			if err := mapNames.Lookup(&key, &namebuf); err != nil {
-				continue
-			}
-
-			zone := strings.Trim(string(namebuf[:]), "\x00")
-			tempC := float64(tempMC) / 1000.0
-
-			status := "SAFE"
-			if tempC > 80.0 {
-				status = "HOT"
-			} else if tempC > 60.0 {
-				status = "WARM"
-			}
-
-			out <- TempReading{TempC: tempC, Status: status, Zone: zone}
-		}
-	}()
+	go pollThermalStats(out, bpf)
 
 	return out, finalCleanup, nil
+}
+
+func pollThermalStats(out chan<- TempReading, bpf *thermalBPF) {
+	defer close(out)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		var key uint32 = 0
+		var tempMC uint32
+		var zoneCount uint32
+		var namebuf [16]byte
+
+		// CRITICAL SECTION: Read BPF Maps for Thermal Data
+		// 1. Check if the BPF program has actually detected a thermal zone (count > 0).
+		if err := bpf.mapCount.Lookup(&key, &zoneCount); err != nil || zoneCount == 0 {
+			continue
+		}
+		// 2. Retrieve the latest temperature reading (in millidegrees Celsius).
+		if err := bpf.mapTemps.Lookup(&key, &tempMC); err != nil {
+			continue
+		}
+		// 3. Retrieve the zone name (e.g., "CPU-therm").
+		if err := bpf.mapNames.Lookup(&key, &namebuf); err != nil {
+			continue
+		}
+
+		zone := strings.Trim(string(namebuf[:]), "\x00")
+		// Convert millidegrees to degrees Celsius.
+		tempC := float64(tempMC) / 1000.0
+
+		// Determine status based on hardcoded safety thresholds.
+		status := "SAFE"
+		if tempC > 80.0 {
+			status = "HOT"
+		} else if tempC > 60.0 {
+			status = "WARM"
+		}
+
+		out <- TempReading{TempC: tempC, Status: status, Zone: zone}
+	}
 }
 
 func runTempWatch(cmd *cobra.Command, args []string) {

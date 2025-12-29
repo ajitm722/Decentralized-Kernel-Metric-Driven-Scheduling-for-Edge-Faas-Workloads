@@ -30,113 +30,130 @@ func init() {
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go cpu_core ../bpf/cpu_core.c -- -O2 -target bpf -I/usr/include/x86_64-linux-gnu
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go cpu_tegra ../bpf/cpu_tegra.c -- -O2 -target bpf -I/usr/include/x86_64-linux-gnu
 
-func StartCPUCollector() (<-chan float64, func(), error) {
+// cpuBPF abstracts the specific eBPF objects (Tegra vs Core)
+type cpuBPF struct {
+	progSwitch *ebpf.Program
+	progExit   *ebpf.Program
+	cpuMap     *ebpf.Map
+	cleanup    func()
+}
 
+func loadCpuTegraBPF() (*cpuBPF, error) {
+	var objs cpu_tegraObjects
+	if err := loadCpu_tegraObjects(&objs, nil); err != nil {
+		return nil, fmt.Errorf("load tegra: %v", err)
+	}
+	return &cpuBPF{
+		progSwitch: objs.HandleSchedSwitch,
+		progExit:   objs.HandleProcessExit,
+		cpuMap:     objs.CpuUsage,
+		cleanup:    func() { objs.Close() },
+	}, nil
+}
+
+func loadCpuCoreBPF() (*cpuBPF, error) {
+	var objs cpu_coreObjects
+	if err := loadCpu_coreObjects(&objs, nil); err != nil {
+		return nil, fmt.Errorf("load core: %v", err)
+	}
+	return &cpuBPF{
+		progSwitch: objs.HandleSchedSwitch,
+		progExit:   objs.HandleProcessExit,
+		cpuMap:     objs.CpuUsage,
+		cleanup:    func() { objs.Close() },
+	}, nil
+}
+
+func StartCPUCollector() (<-chan float64, func(), error) {
+	// necessary to make ebpf code work
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return nil, nil, fmt.Errorf("rlimit error: %v", err)
 	}
 
-	var (
-		hSwitch link.Link
-		hExit   link.Link
-		cpuMap  *ebpf.Map
-		cleanup func()
-		progS   *ebpf.Program
-		progE   *ebpf.Program
-	)
-
 	// 1. Detect Kernel
-	var uname syscall.Utsname
-	syscall.Uname(&uname)
-	var releaseBuf []byte
-	for _, b := range uname.Release {
-		if b == 0 {
-			break
-		}
-		releaseBuf = append(releaseBuf, byte(b))
-	}
-	release := string(releaseBuf)
+	release := detectKernel()
 	log.Printf("Kernel Detected: %s", release)
 
 	// 2. Load the Right Object
+	var loader func() (*cpuBPF, error)
 	if strings.Contains(release, "tegra") {
 		log.Println("Mode: JETSON TEGRA (Offset 28)")
-		var objs cpu_tegraObjects
-		if err := loadCpu_tegraObjects(&objs, nil); err != nil {
-			return nil, nil, fmt.Errorf("load tegra: %v", err)
-		}
-		progS = objs.HandleSchedSwitch
-		progE = objs.HandleProcessExit
-		cpuMap = objs.CpuUsage
-		cleanup = func() { objs.Close() }
+		loader = loadCpuTegraBPF
 	} else {
 		log.Println("Mode: STANDARD CORE (Offset 24)")
-		var objs cpu_coreObjects
-		if err := loadCpu_coreObjects(&objs, nil); err != nil {
-			return nil, nil, fmt.Errorf("load core: %v", err)
-		}
-		progS = objs.HandleSchedSwitch
-		progE = objs.HandleProcessExit
-		cpuMap = objs.CpuUsage
-		cleanup = func() { objs.Close() }
+		loader = loadCpuCoreBPF
+	}
+
+	bpf, err := loader()
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// 3. Attach Tracepoints
-	var err error
-	hSwitch, err = link.Tracepoint("sched", "sched_switch", progS, nil)
+	hSwitch, err := link.Tracepoint("sched", "sched_switch", bpf.progSwitch, nil)
 	if err != nil {
-		cleanup()
+		bpf.cleanup()
 		return nil, nil, fmt.Errorf("attach switch: %v", err)
 	}
 
-	hExit, err = link.Tracepoint("sched", "sched_process_exit", progE, nil)
+	hExit, err := link.Tracepoint("sched", "sched_process_exit", bpf.progExit, nil)
 	if err != nil {
 		hSwitch.Close()
-		cleanup()
+		bpf.cleanup()
 		return nil, nil, fmt.Errorf("attach exit: %v", err)
 	}
 
 	finalCleanup := func() {
 		hSwitch.Close()
 		hExit.Close()
-		cleanup()
+		bpf.cleanup()
 	}
 
 	// 4. Start Polling
 	out := make(chan float64)
+
+	go pollCPUStats(out, bpf)
+
+	return out, finalCleanup, nil
+}
+
+func pollCPUStats(out chan<- float64, bpf *cpuBPF) {
 	numCPUs := float64(runtime.GOMAXPROCS(0))
 	if numCPUs < 1 {
 		numCPUs = float64(runtime.NumCPU())
 	}
 
-	go func() {
-		defer close(out)
-		lastCPU := make(map[uint32]uint64)
-		poll := 500 * time.Millisecond
-		intervalNS := uint64(poll.Nanoseconds())
-		scaledIntervalNS := uint64(float64(intervalNS) * numCPUs)
+	defer close(out)
+	lastCPU := make(map[uint32]uint64)
+	poll := 1 * time.Second
+	intervalNS := uint64(poll.Nanoseconds())
+	// CRITICAL: We scale the interval by the number of CPUs because the kernel
+	// accounts for CPU time per-core. 1 second of wall time on 4 cores = 4 seconds of CPU time.
+	scaledIntervalNS := uint64(float64(intervalNS) * numCPUs)
 
-		ticker := time.NewTicker(poll)
-		defer ticker.Stop()
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
 
-		for range ticker.C {
-			var totalDelta uint64
-			var pid uint32
-			var ns uint64
+	for range ticker.C {
+		var totalDelta uint64
+		var pid uint32
+		var ns uint64
 
-			iter := cpuMap.Iterate()
-			for iter.Next(&pid, &ns) {
-				prev := lastCPU[pid]
-				if ns > prev {
-					totalDelta += ns - prev
-				}
-				lastCPU[pid] = ns
+		// CRITICAL SECTION: Iterate over the BPF Hash Map
+		// This map contains the cumulative CPU time (in ns) for every PID seen.
+		iter := bpf.cpuMap.Iterate()
+		for iter.Next(&pid, &ns) {
+			// Calculate the CPU time consumed by this PID since the last poll.
+			// If ns > prev, the process has run during this interval.
+			prev := lastCPU[pid]
+			if ns > prev {
+				totalDelta += ns - prev
 			}
-			out <- (float64(totalDelta) / float64(scaledIntervalNS)) * 100.0
+			lastCPU[pid] = ns
 		}
-	}()
-
-	return out, finalCleanup, nil
+		// Calculate total CPU usage percentage across all cores.
+		out <- (float64(totalDelta) / float64(scaledIntervalNS)) * 100.0
+	}
 }
 
 func runCPUWatch(cmd *cobra.Command, args []string) {

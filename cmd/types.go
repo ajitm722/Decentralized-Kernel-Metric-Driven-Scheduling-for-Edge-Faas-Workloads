@@ -1,6 +1,22 @@
 package cmd
 
-import "sync"
+import (
+	"sync"
+	"syscall"
+)
+
+func detectKernel() string {
+	var uname syscall.Utsname
+	syscall.Uname(&uname)
+	var releaseBuf []byte
+	for _, b := range uname.Release {
+		if b == 0 {
+			break
+		}
+		releaseBuf = append(releaseBuf, byte(b))
+	}
+	return string(releaseBuf)
+}
 
 // MetricsSnapshot holds the latest metrics captured from all local collectors.
 // It is the standard data format exchanged between collectors and the main app.
