@@ -72,15 +72,17 @@ func StartCPUCollector() (<-chan float64, func(), error) {
 
 	// 1. Detect Kernel
 	release := detectKernel()
-	log.Printf("Kernel Detected: %s", release)
+	logDebug("Kernel Detected: %s", release)
 
 	// 2. Load the Right Object
 	var loader func() (*cpuBPF, error)
 	if strings.Contains(release, "tegra") {
-		log.Println("Mode: JETSON TEGRA (Offset 28)")
+		logDebug("Mode: JETSON TEGRA (Offset 28)")
+
 		loader = loadCpuTegraBPF
 	} else {
-		log.Println("Mode: STANDARD CORE (Offset 24)")
+		logDebug("Mode: STANDARD CORE (Offset 24)")
+
 		loader = loadCpuCoreBPF
 	}
 

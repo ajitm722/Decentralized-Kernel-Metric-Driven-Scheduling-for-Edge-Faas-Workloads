@@ -80,7 +80,7 @@ func StartTEMPCollector() (<-chan TempReading, func(), error) {
 
 	// 1. Detect Kernel
 	release := detectKernel()
-	log.Printf("Kernel Detected (Temp): %s", release)
+	logDebug("Kernel Detected (Temp): %s", release)
 
 	// 2. Load the Right Object
 	var loader func() (*thermalBPF, error)

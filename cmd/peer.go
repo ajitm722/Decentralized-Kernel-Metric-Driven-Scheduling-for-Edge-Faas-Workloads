@@ -100,7 +100,7 @@ func scheduleJob(job *pb.JobRequest) (string, error) {
 	// 1. Get current cluster view
 	view := globalCluster.Snapshot()
 
-	fmt.Printf("[SCHEDULER] Assessing candidates for %s (Req: %.1f CPU, %.1f MEM)\n", job.Name, job.ReqCpu, job.ReqMem)
+	logDebug("[SCHEDULER] Assessing candidates for %s (Req: %.1f CPU, %.1f MEM)\n", job.Name, job.ReqCpu, job.ReqMem)
 
 	var validCandidates []string
 	var safeCandidates []string
@@ -135,7 +135,7 @@ func scheduleJob(job *pb.JobRequest) (string, error) {
 				safeCandidates = append(safeCandidates, ip)
 			}
 
-			fmt.Printf(" -> Candidate Found: %s | CPU: %.1f%% | Temp: %s\n", ip, m.Cpu, displayTemp)
+			logDebug(" -> Candidate Found: %s | CPU: %.1f%% | Temp: %s\n", ip, m.Cpu, displayTemp)
 		}
 	}
 
@@ -167,7 +167,7 @@ func scheduleJob(job *pb.JobRequest) (string, error) {
 
 	// 6. Execution (BLOCKING NOW)
 	if selectedIP == "localhost" {
-		fmt.Println(" -> Executing locally (Blocking)...")
+		logDebug(" -> Executing locally (Blocking)...\n")
 		err := executeDockerContainer(job) // Wait for finish
 		if err != nil {
 			return "localhost", err
@@ -209,7 +209,7 @@ func executeDockerContainer(job *pb.JobRequest) error {
 		return fmt.Errorf("start fail: %v", err)
 	}
 
-	fmt.Printf("[DOCKER] Container %s running... waiting for completion.\n", resp.ID[:12])
+	logDebug("[DOCKER] Container %s running... waiting for completion.\n", resp.ID[:12])
 
 	// 4. WAIT (Blocking)
 	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
@@ -218,14 +218,14 @@ func executeDockerContainer(job *pb.JobRequest) error {
 		return fmt.Errorf("wait error: %v", err)
 	case <-statusCh:
 		// Success!
-		fmt.Printf("[DOCKER] Container %s finished.\n", resp.ID[:DockerShortIDLength])
+		logDebug("[DOCKER] Container %s finished.\n", resp.ID[:DockerShortIDLength])
 		return nil
 	}
 }
 
 // CHANGE 3: forwardJobToPeer blocks and returns the actual node IP
 func forwardJobToPeer(ip string, job *pb.JobRequest) (string, error) {
-	fmt.Printf("[SCHEDULER] Forwarding Job %s to %s (Waiting)...\n", job.Id, ip)
+	logDebug("[SCHEDULER] Forwarding Job %s to %s (Waiting)...\n", job.Id, ip)
 	target := ip + ":" + PeerPort
 
 	// Long timeout to allow execution
@@ -279,7 +279,7 @@ func (s *peerServer) Push(ctx context.Context, m *pb.MetricsSnapshot) (*pb.Ack, 
 
 // CHANGE 4: RPC Handler passes the return values back
 func (s *peerServer) SubmitJob(ctx context.Context, job *pb.JobRequest) (*pb.Ack, error) {
-	fmt.Printf("\n[RPC] Received Job Request: %s\n", job.Name)
+	logDebug("\n[RPC] Received Job Request: %s\n", job.Name)
 
 	target, err := scheduleJob(job)
 	if err != nil {
@@ -358,7 +358,7 @@ func runPeer(cmd *cobra.Command, args []string) {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Printf("Node Started. Gossip Targets: %v\n", targetPeers)
+	logDebug("Node Started. Gossip Targets: %v\n", targetPeers)
 
 	for {
 		select {
@@ -374,10 +374,13 @@ func runPeer(cmd *cobra.Command, args []string) {
 
 			globalCluster.Update("localhost", protoData)
 			broadcastMetrics(targetPeers, protoData)
-			displayCluster()
+
+			if Verbose {
+				displayCluster()
+			}
 
 		case <-stop:
-			fmt.Println("\nShutting down...")
+			logDebug("\nShutting down...")
 			return
 		}
 	}
