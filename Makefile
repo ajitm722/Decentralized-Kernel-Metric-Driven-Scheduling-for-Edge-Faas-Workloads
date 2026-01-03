@@ -81,7 +81,6 @@ deps:
 generate:
 	go generate ./cmd/tempwatch.go
 	go generate ./cmd/cpuwatch.go
-	go generate ./cmd/memwatch.go
 
 # Generate gRPC Proto files
 proto_generate:

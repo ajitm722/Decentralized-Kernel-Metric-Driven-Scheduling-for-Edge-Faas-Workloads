@@ -161,13 +161,13 @@ func runTempWatch(cmd *cobra.Command, args []string) {
 		log.Fatal(err)
 	}
 	defer cleanup()
-	fmt.Println("Collecting Thermal... CTRL+C to stop")
+	logDebug("Collecting Thermal... CTRL+C to stop")
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	for {
 		select {
 		case v := <-stream:
-			fmt.Printf("[%s] %.1f°C (%s)\n", v.Zone, v.TempC, v.Status)
+			logDebug("[%s] %.1f°C (%s)\n", v.Zone, v.TempC, v.Status)
 		case <-stop:
 			return
 		}

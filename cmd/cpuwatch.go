@@ -164,13 +164,13 @@ func runCPUWatch(cmd *cobra.Command, args []string) {
 		log.Fatal(err)
 	}
 	defer cleanup()
-	fmt.Println("Collecting CPU... CTRL+C to stop")
+	logDebug("Collecting CPU... CTRL+C to stop")
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	for {
 		select {
 		case v := <-stream:
-			fmt.Printf("CPU: %.2f%%\n", v)
+			logDebug("CPU: %.2f%%\n", v)
 		case <-stop:
 			return
 		}
