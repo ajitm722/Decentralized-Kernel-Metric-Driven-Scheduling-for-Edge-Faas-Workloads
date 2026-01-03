@@ -22,7 +22,6 @@ typedef __u32 __wsum;
 
 #include "bpf_helpers.h"
 #include "bpf_tracing.h"
-#include "vmlinux.h"
 
 typedef __u16 __sum16;
 
