@@ -25,6 +25,39 @@ Standard CPU metrics are often too slow to catch rapid load spikes. This project
 * **Leaderless Coordination (via P2P Gossip):**
 Traditional clusters rely on a master node to make scheduling decisions. If that master fails or the network partitions, the system halts. This framework uses a **Peer-to-Peer gossip protocol**, allowing every node to independently understand the cluster's health. If a node needs help, it finds a peer directly, eliminating the single point of failure.
 
+## System Demonstration
+
+### 1. Cluster Formation & Gossip Synchronization
+Upon startup, the nodes initialize their local observability planes and begin peering. The image below shows the baseline initialization where nodes identify their hardware characteristics and join the mesh.
+
+![Cluster Base Init](assets/metric_mesh_base.png)
+
+Once connected, the **P2P Gossip Protocol** ensures that every node maintains a local view of the entire cluster's health. In the view below, all nodes (Host, Jetson, Pi 5) are active and exchanging metric payloads. Each node independently calculates the state of its peers without a central coordinator.
+
+![All Nodes Active](assets/metric_mesh(all%20nodes%20active).png)
+
+### 2. Fault Tolerance & Self-Healing
+The system is designed to handle node churn gracefully. When a node stops broadcasting heartbeats (simulated here by taking one node offline), the gossip protocol propagates this failure state across the mesh. The remaining peers update their local routing tables to mark the node as `OFFLINE`, ensuring no new tasks are scheduled to the dead node.
+
+![Node Failure Scenario](assets/metric_mesh(1%20node%20failure).png)
+
+### 3. Metric-Driven Function Offloading
+To validate the scheduler, we utilize a synthetic **Image Resizing** workload (`IMG_RESIZE`). This function is simulated using a `stress-ng` container configured to spawn 2 CPU stressors for 30 seconds, explicitly demanding **70% of a node's CPU capacity**.
+
+In the demonstration below, we trigger **two consecutive requests** to the same node to force a saturation event:
+
+1.  **Request 1 (Saturation):** The node accepts the first task. This immediately drives its CPU usage, while also heavily increasing temperature above the safety threshold .
+2.  **Request 2 (Offloading):** The second request arrives while the node is under load. The scheduler detects the lack of headroom and proactively offloads this task to a random healthy peer in the cluster.
+
+* **Host View:**
+![Offloading Host](assets/function_offloading_host.png)
+
+* **Jetson Orin Nano :**
+![Offloading Jetson](assets/function_offloading_jetson.png)
+
+* **Raspberry Pi 5 :**
+![Offloading Pi5](assets/function_offloading_pi5.png)
+
 ### Key Results
 
 Experimental evaluation on heterogeneous ARM64 clusters demonstrates that this approach can successfully prevent thermal throttling and maintains system responsiveness during simultaneous anomaly events.
@@ -235,3 +268,414 @@ The algorithm for conversion and classification is detailed below:
 * **Millidegree Precision:** The system maintains the kernel's native precision throughout the pipeline, ensuring no data is lost due to premature rounding.
 * **Dynamic Zone Discovery:** By waiting for the `zone_count` flag, the collector handles the asynchronous nature of hardware sensor initialization robustly, avoiding "zero" or "null" readings at startup.
 
+## Design Decisions: Custom eBPF vs. High-Level Frameworks
+
+Initially, high-level frameworks like `bpftrace` were considered for the observability plane due to their rapid development model. However, for a production-grade edge scheduler, **custom C-based eBPF implementations** were selected as the primary mechanism.
+
+This decision was driven by architectural constraints specific to embedded environments, not by correctness (both approaches measure the same kernel events).
+
+### 1. Deployment Constraints & The "Heavy Toolchain" Problem
+The most critical factor was the deployment footprint on resource-constrained devices like the Raspberry Pi and Jetson Nano.
+
+* **bpftrace (JIT Model):** Requires a full LLVM/Clang toolchain to be installed on the edge device to compile scripts at runtime. This consumes hundreds of megabytes of storage and causes significant CPU spikes during agent startup or restart.
+* **Custom eBPF (AOT Model):** Adopts a **Decoupled Verification** pattern. Programs are compiled **Ahead-of-Time** on a powerful developer host. The edge device receives only the lightweight, pre-compiled bytecode embedded within the Go binary.
+This approach removes the need for a compiler on the edge node, ensuring fast "cold starts" and minimal disk usage.
+
+### 2. Data Efficiency (Binary vs. Text)
+* **bpftrace:** Designed for human inspection. It produces text output that must be captured and parsed by the agent. On ARM devices, continuous string parsing at high frequencies consumes non-trivial CPU cycles.
+* **Custom eBPF:** Uses **BPF Maps** as a binary data exchange mechanism. The kernel writes raw integers (counters/timers) directly to memory, and the Go agent reads them via syscalls. This shifts overhead from variable-length parsing to fixed-cost memory reads.
+
+### 3. Interface Stability & The Maintenance Trade-Off
+* **bpftrace:** The primary instability here is **Output Parsing**. bpftrace is designed for humans; its text output can change between versions (e.g., whitespace, column order). Relying on regex to parse this data in a production agent creates a brittle userspace dependency that breaks easily with tool updates.
+
+* **Custom eBPF (This Implementation):** * **The Benefit:** We gain a strict **Binary Contract** between the kernel and the Go agent. The BPF Maps have fixed types (e.g., `uint64`), eliminating the CPU cost and fragility of text parsing.
+    * **The Trade-Off (No CO-RE):** Because this project targets specific embedded kernels (Tegra 5.15) without relying on CO-RE/BTF, the *kernel-side* integration is brittle. We rely on manual struct offsets (as detailed above). This means while the *agent* interface is stable, the *kernel* hooks require manual validation for every major OS update. We chose to accept this **build-time maintenance cost** to achieve **runtime determinism** and zero-parsing overhead on the edge nodes.
+
+![Edge Deployment Strategy](assets/edge_device_deployment.png)
+
+## Gossip-Based Metric Clustering and Job Dissemination Model
+
+### Rationale and Scope
+
+This system employs a gossip-style peer communication model to distribute node-level metrics and assist in decentralized job placement decisions. This architectural choice prioritizes operational simplicity and high availability over the strict consistency guarantees found in centralized orchestration (e.g., Kubernetes etcd).
+
+By avoiding leader election and global state synchronization, the system reduces the overhead required for small-scale edge clusters. However, this design acknowledges that gossip does not provide strict guarantees: metric information may be stale, incomplete, or temporarily inconsistent across nodes. The scheduling logic is designed to make "locally optimal" decisions based on this approximate view of the cluster state.
+
+### Metrics as Approximate Cluster State
+
+The cluster state is not stored in a central database but is instead an aggregate of `MetricsSnapshot` messages periodically emitted(every 3 seconds for now) by each node. These snapshots represent the instantaneous operating condition of a node.
+
+**Key Characteristics of the Metric View:**
+
+* **Instantaneous:** Reflects state at a specific moment, not a moving average.
+* **Unversioned:** The protocol does not use Lamport timestamps or version vectors; it relies on time-based expiration (TTL).
+* **Best-Effort:** There is no guarantee of delivery or order.
+
+Nodes maintain an in-memory cache of these snapshots. Entries not refreshed within a `NodeTTL` window are marked as stale and excluded from scheduling decisions.
+
+### Gossip Communication Pattern
+
+Metric dissemination is implemented as a periodic **push-based gossip** over gRPC (HTTP/2).
+
+* **Initiation:** Time-driven loop (continuous polling).
+* **Direction:** Push-only.
+* **Transport:** `MetricsService` gRPC definition.
+
+#### RPC Contract
+
+The interaction is defined by two primary RPC methods:
+
+```protobuf
+service MetricsService {
+  rpc Push (MetricsSnapshot) returns (Ack);
+  rpc SubmitJob (JobRequest) returns (Ack);
+}
+
+```
+
+1. **Push:** Used for metric dissemination. It acts as a fire-and-forget mechanism where the `Ack` is purely informational.
+2. **SubmitJob:** Used to transfer work. In the current implementation, this call blocks until the job is executed (or rejected) by the peer, providing a synchronous execution guarantee for experimental verification.
+
+### Job Description and Resource Intent
+
+Workloads are submitted via a `JobRequest` message, which expresses **intent** rather than a strict resource reservation. The system does not enforce isolation via cgroups limits but uses these values for admission control filtering.
+
+**Simulated Workload: IMG_RESIZE**
+To validate the scheduler, a synthetic CPU-intensive workload is used:
+
+* **Image:** `alexeiled/stress-ng`
+* **Profile:** 70% CPU request, 10% Memory request.
+* **Behavior:** Runs `stress-ng --cpu 2` for a fixed timeout (30s).
+This workload is chosen to produce predictable CPU pressure without exhausting memory, allowing safe saturation testing.
+
+### Scheduling Algorithm and Execution Logic
+
+The scheduling logic avoids global optimization. Instead, it employs a **Feasibility Filtering** approach followed by a **Randomized Selection with Local Bias**.
+
+![Gossip Informed Scheduler](assets/alg6_gossip_informed_scheduler.png)
+
+#### 1. Candidate Filtering
+
+Upon receiving a job, the scheduler retrieves the current cluster view and filters nodes based on three criteria:
+
+* **Liveness:** Nodes not seen within `NodeTTL` are discarded.
+* **Capacity Headroom:** The node must satisfy:
+*  Current_{CPU} + Request_{CPU} < 95%
+*  Current_{MEM} + Request_{MEM} < 90\%
+
+* **Thermal Safety:** Nodes reporting a `SAFE` thermal status are prioritized. If no safe nodes exist, the system falls back to `WARM` nodes that still possess capacity.
+
+#### 2. Selection Strategy
+
+From the pool of valid candidates, the selection logic applies two heuristics:
+
+1. **Random Dispersion:** A node is initially selected at random to prevent deterministic hotspots (thundering herd problem).
+2. **Localhost Optimization:** If the local node is present in the valid pool, it overrides the random selection. This biases the system toward local execution to eliminate network serialization latency and RPC overhead.
+
+#### 3. Execution Path
+
+* **Local Execution:** If the node selects itself, it interacts directly with the Docker Engine API. The process blocks, waiting for the container to transition from `Start` to `Wait` to `Exit`, ensuring the job is fully complete before returning.
+* **Remote Forwarding:** If a peer is selected, the job is forwarded via the `SubmitJob` RPC. This is a recursive process; the receiving peer treats the forwarded job as a new submission and runs its own scheduling logic.
+
+### Limitations and Failure Modes
+
+This implementation favors implementation speed and decentralization over correctness, leading to specific trade-offs:
+
+* **Recursive Forwarding Loops:** The system does not currently implement a Time-To-Live (TTL) or hop-limit for forwarded jobs. In pathological cases where cluster state changes rapidly, a job could theoretically be bounced between nodes without execution.
+* **Stale Metrics:** Decisions are made on cached data. A node may forward a job to a peer that *was* free 2 seconds ago but is now saturated, leading to rejection or overload.
+* **No Global Admission Control:** There is no "reservation" phase. Two nodes can simultaneously decide to send work to a third node, inadvertently oversubscribing it.
+
+## Rationale for Using gRPC for Metric Gossip
+
+The system relies on long-lived, bidirectional communication channels to exchange periodic metric snapshots and forward job requests between nodes. While several protocols could support this (e.g., Raw TCP, WebSockets, HTTP polling), **gRPC over HTTP/2** was selected as the transport mechanism.
+
+This decision was driven by the specific operational requirements of heartbeat-style protocols, where low per-message overhead and predictable latency are critical, and browser compatibility is not a constraint.
+
+### 1. Communication Characteristics
+
+The system's communication pattern is distinct from typical user-facing web applications:
+
+* **Persistent Connections:** Nodes maintain long-lived links to peers rather than establishing new connections for every request.
+* **High Frequency, Low Payload:** Messages (telemetry, ACKs) are small but transmitted continuously.
+* **Mixed Semantics:** The system requires both stream-like updates (heartbeats) and explicit command-response interactions (job submission).
+* **Strict Contracts:** As an internal cluster protocol, strict typing is preferred over the flexibility of JSON.
+
+### 2. Why gRPC Suits Heartbeat Protocols
+
+#### Strongly Typed, Explicit Contracts
+
+gRPC uses **Protocol Buffers** to define message schemas. In a system where metrics are exchanged automatically every few seconds, schema errors are costly.
+
+* **Validation:** Provides compile-time validation of message structures (`MetricsSnapshot`, `JobRequest`).
+* **Evolution:** Ensures clear, versioned contracts between nodes, reducing the risk of silent protocol drift as the system evolves.
+
+#### Efficient Binary Encoding
+
+Heartbeat traffic consists of small, repetitive messages. gRPC's binary encoding offers tangible benefits over text-based protocols:
+
+* **Payload Size:** Significantly smaller than equivalent JSON payloads.
+* **CPU Efficiency:** Faster serialization/deserialization reduces the overhead on the scheduler thread, which is critical for edge devices with limited resources.
+
+#### HTTP/2 Multiplexing
+
+Although connections are persistent, the ability to multiplex RPCs is vital. HTTP/2 allows control messages (like a `SubmitJob` command) to be interleaved with periodic heartbeat traffic on the same TCP connection without head-of-line blocking (to some extent on http/2).
+
+### 3. Comparison with WebSockets
+
+WebSockets are a common alternative for real-time communication but were rejected for this implementation due to the following trade-offs:
+
+| Feature | gRPC (Selected) | WebSockets |
+| --- | --- | --- |
+| **Protocol Definition** | Strict IDL (Protobuf). Automatic code generation. | Manual. Requires custom schema validation logic. |
+| **Message Format** | Binary by default (Efficient). | Often JSON by default (Parsing overhead). |
+| **Semantics** | Native RPC support (Unary, Streaming). | Message-passing only. Request-Response correlation must be manually implemented. |
+| **Observability** | Native integration with tracing/logging tools. | often requires custom instrumentation. |
+
+### 4. Limitations
+
+While gRPC provides a robust transport layer, it does not solve application-level distributed system challenges. The current implementation must still handle:
+
+* **Message Ordering:** gRPC does not guarantee order across connection resets.
+* **Membership Management:** Failure detection and stale data propagation are handled by the application logic, not the protocol.
+
+**Summary:** gRPC was chosen because it contains complexity in predictable, well-understood layers. It provides the performance of a binary protocol with the developer ergonomics of a structured RPC framework, avoiding the need to implement custom framing and correlation logic required by WebSockets or raw TCP.
+
+## Evaluation Strategy and Scope
+
+In defining the evaluation strategy for this research, a critical distinction is drawn between the `ebpf_edge` prototype and full-scale Cloud-Native Application Platforms (CNAPs) such as Knative or OpenFaaS. While both systems manage function execution, they operate at fundamentally different layers of abstraction.
+
+Consequently, **direct performance benchmarking against these platforms is excluded from this study.** Such comparisons are deemed methodologically invalid and do not yield credible data regarding the efficacy of kernel-level telemetry. Instead, the evaluation focuses on the **non-disruptive nature of the agent**, measuring whether the primary workload can operate alongside the telemetry layer without performance degradation.
+
+The following sections detail the rationale for this scope and the specific methodology used to verify the system's utility.
+
+### Rationale for Excluding Platform Benchmarks
+
+Comparing a specialized telemetry prototype against general-purpose orchestration platforms introduces significant confounding variables that obscure the primary research signal.
+
+**1. Inequivalent Abstractions (The "Feature Gap")**
+Production FaaS platforms provide extensive feature sets including API Gateways, secure authentication, revision history, and persistent logging. `ebpf_edge` is a specialized prototype focused solely on the efficacy of pressure-based scheduling. Benchmarking the execution latency of this prototype against a full-featured platform would primarily measure the processing time of these additional features (like request authentication and route logging) that are intentionally omitted from this study. This would result in a trivial comparison between a minimal prototype and a complex distributed system, rather than a valid assessment of scheduling efficiency.
+
+**2. The "Sidecar Tax" and Protocol Overhead**
+Standard platforms often employ a "Sidecar" pattern (e.g., Envoy Proxy) and rely on HTTP/REST interfaces for widespread interoperability. This solution utilizes binary communication (gRPC) within a trusted edge network. Comparing these approaches would measure the difference between JSON and binary serialization (the "Serialization Tax") rather than the efficiency of the scheduling logic itself.
+
+**3. Network Complexity and Data Path Variability**
+A realistic FaaS invocation involves a complex round-trip lifecycle subject to significant variability (ingress routing, payload buffering, network hops). These network factors typically dominate total execution time, effectively drowning out the signal of the internal scheduling algorithm. Measuring end-to-end latency would therefore result in statistically insignificant data regarding the telemetry plane's contribution.
+
+### Hence had to lean towards: Co-Location and Non-Disruption
+
+For agent-based programs operating on resource-constrained edge devices, the most meaningful performance metric is **overhead**—specifically, the ability of the main workload to function without disruption while the agent is active.
+
+The validity of the proposed architecture rests on the hypothesis that my agent provides its pressure scheduling capabilities without imposing the "observer effect" on the system it monitors. Therefore, the evaluation methodology isolates the agent’s impact on application execution time under controlled and repeatable workloads.
+
+---
+
+### Evaluation Objective
+
+The objective of this evaluation is to quantify the runtime overhead introduced by the proposed eBPF-based telemetry agent when deployed continuously in the background of an edge node. This study focuses on **isolating the agent’s impact on application execution time** to verify that kernel-level telemetry enables real-time observability without imposing prohibitive performance costs.
+
+### Experimental Methodology
+
+**Workload-Centric Design**
+The evaluation follows a workload-centric methodology, where identical workloads are executed under two conditions:
+
+1. **Baseline execution:** The workload runs on a clean system with no telemetry agent present.
+2. **Agent-enabled execution:** The same workload runs while the proposed telemetry agent executes continuously in the background.
+
+No instrumentation is added to the workload itself. The telemetry agent operates independently and passively, mirroring its intended deployment in real edge environments.
+
+**Controlled Variables**
+To ensure scientific validity, the following variables are held constant across all experiments:
+
+* Hardware platform
+* Operating system and kernel
+* Docker runtime
+* Workload parameters
+* Measurement method (wall-clock execution time via `/usr/bin/time`)
+* Number of iterations (N = 10)
+
+The *only* variable between paired experiments is the presence or absence of the telemetry agent.
+
+### Benchmark Configuration
+
+Two workload classes were selected to reflect common edge execution patterns:
+
+**1. CPU-Bound Workload**
+A deterministic, compute-intensive workload is generated using stress-ng’s matrix multiplication kernel:
+
+```bash
+stress-ng --cpu 0 --cpu-method matrixprod --cpu-ops 1000
+
+```
+
+This workload saturates CPU resources and naturally triggers thermal events, exercising the agent’s CPU and thermal telemetry paths.
+
+**2. Memory-Bound Workload**
+A memory-intensive workload is generated using multiple virtual memory workers:
+
+```bash
+stress-ng --vm 4 --vm-bytes 512M --vm-ops 3000
+
+```
+
+This workload induces sustained memory churn (~2 GB active) and kernel reclaim activity, directly stressing the agent’s `/proc/meminfo` polling-based memory collector.
+
+### Hardware Platforms
+
+Experiments were conducted on two representative edge devices:
+
+1. **NVIDIA Jetson Orin Nano** (ARM64, higher-performance edge accelerator)
+2. **Raspberry Pi 5** (ARM64, general-purpose low-power edge node)
+
+This dual-platform evaluation demonstrates the agent’s behavior across heterogeneous edge hardware.
+
+### Experimental Results
+
+#### CPU-Bound Workload Results
+
+**Visual Analysis:**
+To visualize the impact, we capture the execution profile under both baseline and agent-enabled conditions.
+
+*Figure 1: Baseline CPU execution profile (No Agent)*
+![Baseline CPU execution](assets/cpu_baseline_benchmark.png)
+
+*Figure 2: CPU execution profile with active eBPF Agent*
+![Agent CPU execution](assets/cpu_agent_benchmark.png)
+
+**Quantitative Analysis:**
+
+**1. Jetson Orin Nano**
+| Condition | Avg (s) | Min (s) | Max (s) |
+| :--- | :--- | :--- | :--- |
+| Baseline | 29.25 | 28.99 | 29.42 |
+| Agent Enabled | 29.41 | 29.18 | 29.79 |
+
+* **Observed overhead:** ~0.55%
+* Calculation: `(29.41 - 29.25) / 29.25`
+
+**2. Raspberry Pi**
+| Condition | Avg (s) | Min (s) | Max (s) |
+| :--- | :--- | :--- | :--- |
+| Baseline | 35.08 | 34.83 | 35.78 |
+| Agent Enabled | 35.98 | 34.86 | 37.30 |
+
+* **Observed overhead:** ~2.57%
+* Calculation: `(35.98 - 35.08) / 35.08`
+
+
+#### Memory-Bound Workload Results
+
+**Visual Analysis:**
+
+*Figure 3: Baseline Memory execution profile (No Agent)*
+![Baseline Memory execution](assets/mem_baseline_benchmark.png)
+
+*Figure 4: Memory execution profile with active eBPF Agent*
+![Agent Memory execution](assets/mem_agent_benchmark.png)
+
+**Quantitative Analysis:**
+Under memory-intensive workloads, the telemetry agent exhibits no consistent or systematic increase in execution time across either platform. In several runs, agent-enabled execution times fall within or below baseline variance.
+
+### Analysis and Interpretation
+
+**CPU Telemetry Impact**
+Across both evaluated platforms, the telemetry agent introduces a small but measurable execution-time increase under sustained CPU pressure.
+
+* **Jetson Orin Nano:** Overhead remains below **1%**, suggesting the cost of tracepoint-based telemetry is modest relative to available compute capacity.
+* **Raspberry Pi:** Relative overhead reaches approximately **2–3%**. This confirms that telemetry overhead becomes more visible as hardware margins narrow.
+
+*Note:* The CPU workload used here is intentionally deterministic. It represents a lower-bound estimate under controlled stress and does not capture I/O interleaving or complex context-switching behaviors.
+
+**Memory Telemetry Impact**
+The agent exhibited no significant overhead during the memory benchmarks. This indicates that the cost of polling `/proc/meminfo` at the chosen frequency is small relative to the memory activity induced by the workload itself. However, this does not model long-lived fragmentation or high container density scenarios.
+
+**Variance and Stability**
+Across all experiments, execution-time variance under agent-enabled conditions remains broadly comparable to baseline variance. No evidence of monotonic degradation, runaway latency, or execution failure was observed during the benchmark runs.
+
+### Summary
+
+This evaluation demonstrates that the runtime overhead of a continuously running eBPF-based telemetry agent is minimal. The results show a small but non-zero overhead (0.55% to 2.57%), with greater relative impact on constrained devices. These findings support the claim that kernel-level telemetry can be integrated into edge systems without prohibitive performance penalties, validating the utility and performance of the proposed architecture.
+
+## Future Work and Architectural Extensions
+
+While the current implementation demonstrates the feasibility of decentralized, kernel-metric-driven scheduling on constrained edge hardware, several architectural limitations and extension points have been identified. These represent deliberate trade-offs made to prioritize clarity, determinism, and experimental tractability in the current prototype. This section outlines concrete directions for future work.
+
+---
+
+### 1. Scheduler Robustness and Control-Plane Refinement
+
+The current gossip-informed scheduler is intentionally simple and favors feasibility over optimality. While this aligns with the goals of a lightweight edge system, it introduces known failure modes that can be addressed incrementally:
+
+* **Job Forwarding TTL / Hop Limits:**
+  Recursive job forwarding currently has no upper bound. Introducing a hop-count or TTL field in `JobRequest` would eliminate pathological forwarding loops under rapidly changing cluster conditions.
+
+* **Admission Control with Soft Reservations:**
+  The scheduler relies on optimistic filtering without reservation semantics. A lightweight, time-bounded “intent reservation” (e.g., speculative capacity decrement with expiry) could reduce oversubscription without introducing global coordination.
+
+* **Thermal-Aware Backoff Policies:**
+  Currently, `WARM` nodes are treated as a fallback tier. Future work could implement exponential backoff or cooling-aware scheduling, delaying non-urgent jobs when the cluster is thermally constrained rather than immediately forwarding them.
+
+---
+
+### 2. Refinement of eBPF Telemetry Hooks
+
+The observability plane deliberately balances precision against kernel complexity, but several refinements are possible:
+
+* **Expanded Scheduler Signal Set:**
+  The CPU collector currently derives utilization solely from `sched_switch`. Additional tracepoints such as `sched_wakeup`, `sched_wakeup_new`, or runqueue length metrics could improve early detection of contention and latency amplification.
+
+* **Memory Pressure Signals Beyond `/proc/meminfo`:**
+  While polling `MemAvailable` is stable and portable, future iterations could selectively incorporate reclaim-related tracepoints (`mm_vmscan_*`) as *supplementary* signals, enabling earlier detection of allocator stress without relying exclusively on reclaim events.
+
+* **Thermal Zone Specialization:**
+  The current thermal model treats all discovered zones uniformly. Future work could classify zones (CPU, GPU, PMIC) and apply differentiated policies, particularly on heterogeneous SoCs such as Jetson platforms where GPU thermals often dominate throttling behavior.
+
+* **CO-RE / BTF Exploration (Selective):**
+  Although manual struct offsets were chosen for determinism, selective adoption of CO-RE for non-critical paths could reduce maintenance overhead across kernel upgrades, provided verification cost and startup latency remain acceptable for edge deployments.
+
+---
+
+### 3. Runtime Evolution: From Docker to containerd
+
+The current execution path relies on Docker Engine as a convenience layer. While sufficient for prototyping, this introduces unnecessary indirection:
+
+* **Elimination of the Docker Daemon:**
+  Docker introduces an additional control plane, API translation layer, and background services that are not strictly required for function execution on edge nodes.
+
+* **Direct Integration with containerd:**
+  Migrating to `containerd` would allow the scheduler to interact directly with the container runtime via the CRI or native gRPC APIs, reducing latency, memory footprint, and failure surface.
+
+* **Improved Scheduling Semantics:**
+  containerd integration enables finer-grained lifecycle control (task creation, pause/resume, snapshot reuse) and opens the door to tighter coupling between scheduler decisions and runtime execution state.
+
+This transition would align the system more closely with modern cloud-native internals while remaining lightweight enough for embedded deployments.
+
+---
+
+### 4. Evaluation Scope Expansion
+
+The current evaluation focuses exclusively on **non-disruptive co-location**, which is appropriate for validating the observability plane. Future evaluations could expand along controlled dimensions:
+
+* **Latency-Sensitive Workloads:**
+  Measuring deadline miss rates under mixed CPU and I/O workloads would strengthen claims around real-time responsiveness.
+
+* **Thermal Recovery Dynamics:**
+  Evaluating how quickly nodes recover under repeated burst conditions would provide insight into long-term hardware sustainability.
+
+* **Scaling Beyond Small Clusters:**
+  While the system targets small edge meshes, evaluating gossip convergence and scheduling behavior at larger peer counts would clarify practical upper bounds.
+
+---
+
+### 5. Toward Policy-Driven Edge Scheduling
+
+Finally, the current system deliberately separates **mechanism** from **policy**. This creates an opportunity for future work to explore:
+
+* Pluggable scheduling policies (e.g., latency-biased vs energy-biased)
+* Workload classification (best-effort vs critical)
+* Integration with higher-level intent systems (e.g., declarative edge SLAs)
+
+Such extensions could be layered on top of the existing telemetry and gossip substrate without altering the core architecture.
+
+---
+
+**In summary**, the current prototype establishes a stable, low-overhead foundation for decentralized, telemetry-driven edge scheduling. The future work outlined here focuses not on fundamental redesign, but on strengthening robustness, improving observability fidelity, and reducing runtime overhead—incrementally evolving the system toward a production-grade edge control plane while preserving its decentralized characteristics.
