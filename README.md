@@ -119,6 +119,30 @@ The logic follows a strict event-driven flow:
 
 This approach ensures **O(1) complexity**—constant time lookups regardless of system load—allowing the agent to monitor high-frequency scheduling without degrading performance.
 
+### Limitation: Short-Lived Processes and Polling Boundaries
+
+One known limitation of this approach arises from the interaction between **event-driven kernel cleanup** and **periodic userspace polling**.
+
+When a process exits, the `sched_process_exit` tracepoint immediately removes its entries from both the `start_times` and `cpu_usage` maps. If this cleanup occurs **before the next userspace polling interval (1 second)**, the final accumulated CPU time for that process may not be observed by the userspace collector.
+
+In practical terms, this means that **very short-lived processes**—those that start, execute briefly, and terminate entirely within a single polling window—may have their CPU contribution omitted from the aggregated node-level utilization.
+
+This behavior is intentional rather than accidental:
+
+* The scheduler operates on **node-level saturation signals**, not per-process accounting.
+* Processes that execute and terminate within a sub-second window contribute negligibly to sustained CPU pressure.
+* Capturing every transient micro-task would increase state retention complexity and map pressure without materially improving scheduling decisions.
+
+To the best of my knowledge, ignoring such short-lived workloads is a reasonable approximation for the intended use case: **preventing sustained overload and thermal throttling**, rather than performing precise accounting or billing.
+
+If future extensions require stricter accounting (e.g., per-job attribution or short-task profiling), this limitation could be addressed by:
+
+* Delaying cleanup until after userspace consumption, or
+* Aggregating CPU usage into a global bucket independent of PID lifetime.
+
+For the current design, the trade-off favors **simplicity, bounded memory usage, and predictable behavior** over perfect completeness at sub-second granularity.
+
+
 ### Handling Heterogeneity: Standard vs. Tegra Kernels
 A major challenge in edge computing is hardware variance. Even when running "Linux," vendor-specific kernels often modify internal data structures (ABIs).
 
@@ -270,7 +294,44 @@ The algorithm for conversion and classification is detailed below:
 
 ## Design Decisions: Custom eBPF vs. High-Level Frameworks
 
-Initially, high-level frameworks like `bpftrace` were considered for the observability plane due to their rapid development model. However, for a production-grade edge scheduler, **custom C-based eBPF implementations** were selected as the primary mechanism.
+###  Rationale: Why Custom Telemetry over Standard CLI Tools?
+
+A natural question when building a custom agent is: *Why not simply parse the output of existing system utilities or performance tools (like `vmstat`,`perf` or `top`)?*
+
+While these tools are production-grade for general monitoring, this project necessitates a custom architecture to satisfy the specific requirements of an **automated control loop**. The decision relies on three key factors: **Signal Fidelity**, **Data Safety**, and **Future Extensibility**.
+
+### 1. Fidelity: Addressing the Sampling Problem (CPU & Thermal)
+
+Standard tools operate on a fixed-interval **Polling Model**. They wake up once per second, read system counters, and report an average.
+
+* **The Limitation:** A polling tool is susceptible to **aliasing**. If a workload spikes the CPU for 200ms and then sleeps, a 1Hz sampler may completely miss the event or report it as low utilization. For a scheduler trying to prevent thermal runaway, missing these micro-bursts is critical.
+* **The eBPF Advantage:** For fast-moving metrics (CPU and Thermal), this agent uses **Event-Driven Hooks**. By attaching to kernel tracepoints (like `sched_switch`), it captures every execution slice. This guarantees the scheduler(which also polls ebpf maps every 1 second) reacts to the *true* cost of the workload, providing a level of granularity that sampling tools cannot strictly guarantee.
+
+### 2. Reliability: Text vs. Binary Contracts
+
+CLI tools output formatted text designed for human readability.
+
+* **The Limitation:** Scripts that parse CLI output are brittle. A change in system locale (e.g., `50.5` vs `50,5`), column alignment, or tool version can silently break the parser.
+* **The Custom Agent Advantage:** The interface between the kernel and the scheduler is a **Strict Binary Contract**. The agent reads typed integers (e.g., `uint64`) directly. This ensures the data is type-safe and unambiguous, preventing "silent failures" where a scheduler might misinterpret a formatted string.
+
+### 3. Extensibility and Pragmatism (The Memory Case)
+
+This system employs a **Hybrid Design**.
+For memory pressure, the agent currently polls `/proc/meminfo`—similar to standard tools. This is a deliberate, pragmatic compromise: high-level capacity metrics (`MemAvailable`) are sufficient for basic placement decisions.
+
+However, the custom architecture provides an **extensibility path** that CLI tools lack. If the scheduling logic requires deeper insights in the future, the agent can be updated to hook allocator tracepoints (e.g., `mm_page_alloc`) or OOM killer events (`oom_kill_process`) without changing the deployment architecture. This allows the system to evolve from simple "capacity monitoring" to "latency profiling," a transition that is difficult to achieve with standard CLI wrappers.
+
+### Comparison
+
+| Feature | CLI Wrapper / Standard Tools | This Project (Hybrid Agent) |
+| --- | --- | --- |
+| **CPU/Thermal** | **Polling** (Prone to aliasing spikes) | **Event-Driven eBPF** (Captures micro-bursts) |
+| **Memory** | Polling `/proc` | Polling `/proc` (with eBPF extensibility path) |
+| **Data Interface** | Unstable Text (Human-focused) | **Typed Binary** (Machine-focused) |
+| **Primary Goal** | General Observability | **Automated Control Signals** |
+
+
+Even high-level frameworks like `bpftrace` were considered for the observability plane due to their rapid development model. However, for a production-grade edge scheduler, **custom C-based eBPF implementations** were selected as the primary mechanism.
 
 This decision was driven by architectural constraints specific to embedded environments, not by correctness (both approaches measure the same kernel events).
 
