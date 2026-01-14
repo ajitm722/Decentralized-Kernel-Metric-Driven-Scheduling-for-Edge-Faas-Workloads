@@ -729,13 +729,56 @@ The current evaluation focuses exclusively on **non-disruptive co-location**, wh
 
 ### 5. Toward Policy-Driven Edge Scheduling
 
-Finally, the current system deliberately separates **mechanism** from **policy**. This creates an opportunity for future work to explore:
+The current system deliberately separates **mechanism** from **policy**. This creates an opportunity for future work to explore:
 
 * Pluggable scheduling policies (e.g., latency-biased vs energy-biased)
 * Workload classification (best-effort vs critical)
 * Integration with higher-level intent systems (e.g., declarative edge SLAs)
 
 Such extensions could be layered on top of the existing telemetry and gossip substrate without altering the core architecture.
+
+---
+
+### 6. Workload Pattern Expansion: Services and Distributed Cron
+
+The current prototype supports only one execution pattern: ephemeral, run-to-completion tasks. To support a broader range of real-world edge applications, future work could extend the orchestrator to handle two critical patterns: Long-Running Services and Distributed Scheduled Tasks.
+
+#### Long-Running Services (Dynamic Load Balancing)
+
+Edge deployments frequently require persistent services (e.g., local databases, MQTT brokers, or inference servers) rather than just one-off functions. Supporting this requires a shift from "placement-time" scheduling to "request-time" routing.
+
+* **Challenge:** Unlike ephemeral tasks where the decision is made once (where to spawn), persistent services require continuous traffic management.
+* **Proposed Architecture:** A lightweight **Layer-4 Load Balancer** can be implemented using the existing gossip substrate.
+1. **Ingress Gateway:** A designated high-capacity node (e.g., the Host Controller or Jetson) acts as the ingress point.
+2. **eBPF Data Plane:** Instead of a heavy userspace proxy (like Nginx), the system could leverage eBPF XDP (eXpress Data Path) to route incoming TCP packets directly to backend nodes. While this Layer 4 routing architecture (using eBPF XDP) is validated by industry-standard tools like Cilium in Kubernetes, this proposal introduces a novel differentiator: utilizing the custom, gossip-disseminated metrics (CPU pressure, thermal headroom) as dynamic weights in the routing algorithm. This enables a lightweight, thermally-aware load balancer that operates at kernel speed, distinct from standard connection-based strategies.
+3. **Dynamic Re-weighting:** The load balancer updates its routing table weights in real-time based on the same gossip metrics used for task scheduling, ensuring that traffic is seamlessly diverted away from thermally throttled nodes without restarting the service containers.
+
+#### A. Distributed Scheduled Tasks (Leaderless Cron)
+
+Certain edge workflows require **Singleton Execution**—tasks that must run exactly once for the entire cluster at a specific time. Examples include cluster-wide telemetry aggregation, external data ingestion, or federated model averaging.
+
+To implement this without a central coordinator, the system must ensure that every node maintains a synchronized local copy of the schedule configuration. To determine ownership dynamically, future work could integrate a **Two-Phase Hashed Trigger**:
+
+1. **Phase 1: Deterministic Self-Election (The "Trigger"):**
+At the scheduled time, every node independently calculates a hash of the Job ID combined with the current timestamp (e.g., `Hash("DailyReport" + "2026-01-12 12:00") % NodeCount`). Including the specific date ensuring that the selected "Initiator" node rotates daily, preventing any single node from becoming a permanent bottleneck.
+2. **Phase 2: Standard Scheduling (The "Execution"):**
+The node that identifies itself as the Initiator generates the `JobRequest` while other nodes stay passive. Crucially, it does not strictly execute the workload itself. Instead, it submits the request to the existing **Gossip-Informed Scheduler**. This allows the heavy lifting to be offloaded to a healthier peer if the Initiator happens to be busy, effectively decoupling *responsibility* from *execution*.
+
+#### B. Per-Node Maintenance and "Drain Mode"
+
+Conversely, maintenance tasks are often mandatory and originate from a specific node. However, their execution strategy depends on whether they are bound to the hardware or portable.
+
+**1. Location-Bound Maintenance (Drain Mode with Critical Offloading):**
+Certain tasks, such as sensor calibration or filesystem checks, *must* execute on the specific hardware. When such a task runs, the node could enter a **"Drain Mode"**:
+
+* **Ingress Block:** The node updates its gossip status to `MAINTENANCE`, effectively rejecting new remote jobs from peers.
+* **Critical Egress:** Crucially, the node remains active as a job submitter. If a local safety-critical event occurs during maintenance (e.g., a Jetson LiDAR detecting an unexpected "ghost object"), the node does not queue the anomaly. Instead, it packages the sensor data and *immediately offloads* the analysis job to a healthy peer (Depending on how heavy the maintenance work is and the hardware capabilities of that node).
+
+This state ensures that while the node is "closed" for general business, it can still preserve system safety by exporting its own critical anomalies to the cluster.
+
+**2. Portable Maintenance Tasks:**
+Other maintenance tasks, such as parsing older logs or generating statistical summaries, originate locally but do not strictly require local execution.
+For these workloads, the system utilizes the standard **Gossip-Informed Scheduler** (see Job Dissemination section). The node treats the maintenance task as a standard `JobRequest`. If the node is currently under pressure (or in Drain Mode), the scheduler's inherent logic will automatically select a suitable peer to execute the task, treating it no differently than a standard application workload.
 
 ---
 
